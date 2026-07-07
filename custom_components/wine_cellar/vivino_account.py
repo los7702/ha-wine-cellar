@@ -45,7 +45,10 @@ HEADERS = {
 }
 
 # Keys that may hold the API token in the login response
-_TOKEN_KEYS = ("token", "api_token", "access_token", "jwt")
+_TOKEN_KEYS = (
+    "token", "api_token", "access_token", "jwt",
+    "oauth_token", "bearer_token", "session_token",
+)
 # Keys that may hold the record list in cellar/wishlist responses
 _LIST_KEYS = (
     "cellar", "cellar_wines", "user_cellar", "wishlist", "user_wines",
@@ -75,11 +78,18 @@ class VivinoAccountClient:
         self._token: str | None = None
         self._user_id: int | None = None
         self.alias: str = ""
+        # True once a freshly logged-in session was still rejected; stops
+        # every subsequent request from hammering the login endpoint again.
+        self._session_rejected = False
 
     @property
     def user_id(self) -> int | None:
         """Return the Vivino user ID once logged in."""
         return self._user_id
+
+    def reset_session_backoff(self) -> None:
+        """Allow one fresh re-login attempt (called at the start of a sync)."""
+        self._session_rejected = False
 
     def _get_session(self) -> aiohttp.ClientSession:
         """Return the dedicated aiohttp session, creating it if needed."""
@@ -166,6 +176,17 @@ class VivinoAccountClient:
     async def _async_scrape_token(self) -> str | None:
         """Extract the API bearer token from a logged-in Vivino web page."""
         session = self._get_session()
+
+        # Cheapest first: the login may have set a token-bearing cookie
+        try:
+            for cookie in session.cookie_jar:
+                name = cookie.key.lower()
+                if "token" in name and len(cookie.value) > 20:
+                    _LOGGER.debug("Using Vivino token from cookie %s", cookie.key)
+                    return cookie.value
+        except Exception as err:
+            _LOGGER.debug("Cookie jar token scan failed: %s", err)
+
         headers = {**HEADERS, "Accept": "text/html"}
         for url in ("https://www.vivino.com/wines", "https://www.vivino.com/"):
             try:
@@ -177,7 +198,8 @@ class VivinoAccountClient:
                         continue
                     html = await resp.text()
                 match = re.search(
-                    r'"(?:api_token|apiToken|access_token|accessToken)"'
+                    r'"(?:api_token|apiToken|access_token|accessToken'
+                    r'|oauth_token|oauthToken|bearer_token|bearerToken)"'
                     r'\s*:\s*"([A-Za-z0-9._\-]{20,})"',
                     html,
                 )
@@ -220,13 +242,18 @@ class VivinoAccountClient:
             if self._token:
                 headers["Authorization"] = f"Bearer {self._token}"
 
+            had_token = self._token is not None
             async with session.get(
                 f"{API_BASE}/{path.lstrip('/')}",
                 params=params,
                 headers=headers,
                 timeout=REQUEST_TIMEOUT,
             ) as resp:
-                if resp.status in (401, 403) and attempt == 1:
+                if (
+                    resp.status in (401, 403)
+                    and attempt == 1
+                    and not self._session_rejected
+                ):
                     _LOGGER.debug(
                         "Vivino API %s returned %s, re-authenticating",
                         path, resp.status,
@@ -235,14 +262,38 @@ class VivinoAccountClient:
                     await self.async_login()
                     continue
                 if resp.status in (401, 403):
+                    self._session_rejected = True
+                    # Include everything needed to diagnose remotely: did we
+                    # even have a token, and what did Vivino answer?
+                    server_msg = ""
+                    try:
+                        body = await resp.json(content_type=None)
+                        err = body.get("error") if isinstance(body, dict) else None
+                        if isinstance(err, dict):
+                            server_msg = err.get("message", "")
+                        elif isinstance(err, str):
+                            server_msg = err
+                    except Exception:
+                        pass
+                    detail = f"HTTP {resp.status}"
+                    detail += ", bearer token attached" if had_token else (
+                        ", NO bearer token available"
+                    )
+                    if server_msg:
+                        detail += f", Vivino says: {server_msg!r}"
                     raise VivinoAuthError(
-                        f"Vivino rejected the session for {path} "
-                        f"(HTTP {resp.status})"
+                        f"Vivino rejected the session for {path} ({detail})"
+                    )
+                if resp.status == 429:
+                    raise RuntimeError(
+                        f"Vivino is rate-limiting requests ({path} returned "
+                        "HTTP 429) — wait a while before syncing again"
                     )
                 if resp.status != 200:
                     raise RuntimeError(
                         f"Vivino API {path} returned HTTP {resp.status}"
                     )
+                self._session_rejected = False
                 return await resp.json(content_type=None)
         return None
 
@@ -271,9 +322,29 @@ class VivinoAccountClient:
                 break
         return records
 
+    async def _fetch_first_working(self, paths: tuple[str, ...]) -> list[dict[str, Any]]:
+        """Fetch records from the first endpoint variant that responds.
+
+        An endpoint that answers successfully with zero records is a valid
+        outcome (an empty cellar/list) and stops the fallback chain; only
+        rejected/failed endpoints advance to the next variant.
+        """
+        last_err: Exception | None = None
+        for path in paths:
+            try:
+                return await self._fetch_paginated(path)
+            except (VivinoAuthError, RuntimeError) as err:
+                _LOGGER.debug("Vivino endpoint %s failed: %s", path, err)
+                last_err = err
+        if last_err:
+            raise last_err
+        return []
+
     async def async_get_cellar(self) -> list[dict[str, Any]]:
         """Return the user's Vivino cellar as parsed wine dicts."""
-        raw = await self._fetch_paginated(f"users/{self._user_id}/cellar")
+        raw = await self._fetch_first_working(
+            (f"users/{self._user_id}/cellar", "cellars")
+        )
         wines = [w for w in (_parse_user_wine(r) for r in raw) if w]
         _log_parse_outcome("cellar", raw, wines)
         return wines
@@ -292,18 +363,9 @@ class VivinoAccountClient:
         the user has rated or scanned. Two endpoint variants exist; try the
         user-scoped one first.
         """
-        raw: list[dict[str, Any]] = []
-        last_err: Exception | None = None
-        for path in (f"users/{self._user_id}/vintages", "user_vintages"):
-            try:
-                raw = await self._fetch_paginated(path)
-                if raw:
-                    break
-            except (VivinoAuthError, RuntimeError) as err:
-                _LOGGER.debug("My Wines endpoint %s failed: %s", path, err)
-                last_err = err
-        if not raw and last_err:
-            raise last_err
+        raw = await self._fetch_first_working(
+            (f"users/{self._user_id}/vintages", "user_vintages")
+        )
         wines = [w for w in (_parse_user_wine(r) for r in raw) if w]
         _log_parse_outcome("my wines", raw, wines)
         return wines
@@ -513,6 +575,8 @@ async def async_sync_from_vivino(
         "errors": [],
     }
 
+    client.reset_session_backoff()
+
     # Shared bookkeeping of what's already in the local cellar, so cellar
     # and My Wines imports in the same run dedupe against each other too.
     existing_ids: dict[str, int] = {}
@@ -573,9 +637,9 @@ async def async_sync_from_vivino(
             ) = _import_wines(cellar, "vivino_cellar")
         except VivinoAuthError as err:
             result["errors"].append(
-                f"Cellar: {err} — the Vivino Wine Cellar is a Vivino Premium "
-                "feature; without it, use the 'my_wines' sync target for your "
-                "rated/scanned wines instead"
+                f"Cellar: {err} — note: your rated/scanned wines still sync "
+                "via the 'my_wines' target, and without a Vivino Premium "
+                "subscription the cellar is not available at all"
             )
         except Exception as err:
             _LOGGER.warning("Vivino cellar sync failed: %s", err)
