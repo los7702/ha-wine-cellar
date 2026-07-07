@@ -1,0 +1,29 @@
+name: Vivino API Diagnostic
+
+# Manual only. Uses the VIVINO repo secret to probe which Vivino endpoints
+# authenticate. The script prints only structural facts (status codes, JSON
+# key names, string lengths) — never the credentials or any token value.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - claude/vivino-winecellar-integration-8epf98
+    paths:
+      - scripts/vivino_diagnostic.py
+      - .github/workflows/vivino-diagnostic.yml
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install deps
+        run: pip install aiohttp
+      - name: Run Vivino diagnostic
+        env:
+          VIVINO: ${{ secrets.VIVINO }}
+        run: python scripts/vivino_diagnostic.py
