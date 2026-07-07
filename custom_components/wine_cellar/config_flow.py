@@ -10,7 +10,12 @@ from homeassistant.config_entries import ConfigEntry, ConfigFlow, OptionsFlow
 from homeassistant.core import callback
 from homeassistant.data_entry_flow import FlowResult
 
-from .const import DOMAIN
+from .const import (
+    CONF_VIVINO_AUTO_SYNC,
+    CONF_VIVINO_EMAIL,
+    CONF_VIVINO_PASSWORD,
+    DOMAIN,
+)
 
 
 class WineCellarConfigFlow(ConfigFlow, domain=DOMAIN):
@@ -69,6 +74,24 @@ class WineCellarOptionsFlow(OptionsFlow):
                             "gemini_api_key", ""
                         ),
                     ): str,
+                    vol.Optional(
+                        CONF_VIVINO_EMAIL,
+                        default=self.config_entry.options.get(
+                            CONF_VIVINO_EMAIL, ""
+                        ),
+                    ): str,
+                    vol.Optional(
+                        CONF_VIVINO_PASSWORD,
+                        default=self.config_entry.options.get(
+                            CONF_VIVINO_PASSWORD, ""
+                        ),
+                    ): str,
+                    vol.Optional(
+                        CONF_VIVINO_AUTO_SYNC,
+                        default=self.config_entry.options.get(
+                            CONF_VIVINO_AUTO_SYNC, False
+                        ),
+                    ): bool,
                 }
             ),
         )

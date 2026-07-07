@@ -17,7 +17,10 @@
         "title": "Cork Dork Options",
         "data": {
           "default_wine_type": "Default wine type for new entries",
-          "gemini_api_key": "Google Gemini API key (for AI label recognition)"
+          "gemini_api_key": "Google Gemini API key (for AI label recognition)",
+          "vivino_email": "Vivino account email (for cellar/wishlist sync)",
+          "vivino_password": "Vivino account password",
+          "vivino_auto_sync": "Automatically sync Vivino cellar twice a day"
         }
       }
     }

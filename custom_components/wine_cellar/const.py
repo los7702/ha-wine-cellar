@@ -61,7 +61,13 @@ CONF_WINE_HISTORY = "wine_history"
 
 CONF_GEMINI_API_KEY = "gemini_api_key"
 
+CONF_VIVINO_EMAIL = "vivino_email"
+CONF_VIVINO_PASSWORD = "vivino_password"
+CONF_VIVINO_AUTO_SYNC = "vivino_auto_sync"
+
+VIVINO_AUTO_SYNC_INTERVAL_HOURS = 12
+
 ATTR_TOTAL_BOTTLES = "total_bottles"
 ATTR_TOTAL_CAPACITY = "total_capacity"
 
-FRONTEND_VERSION = "20260308a"
+FRONTEND_VERSION = "20260707a"

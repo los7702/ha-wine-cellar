@@ -26,6 +26,7 @@ async def async_setup_entry(
     entities: list[SensorEntity] = [
         WineCellarTotalSensor(storage, entry),
         WineCellarCapacitySensor(storage, entry),
+        WineCellarVivinoSyncSensor(hass, entry),
     ]
 
     for cabinet in storage.cabinets:
@@ -98,6 +99,51 @@ class WineCellarCapacitySensor(SensorEntity):
             "total_bottles": stats["total_bottles"],
             "total_capacity": stats["total_capacity"],
             "available_slots": stats["available_slots"],
+        }
+
+
+class WineCellarVivinoSyncSensor(SensorEntity):
+    """Sensor reporting the last Vivino account sync."""
+
+    _attr_icon = "mdi:cloud-sync"
+    _attr_native_unit_of_measurement = "bottles"
+
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
+        """Initialize sensor."""
+        self._hass = hass
+        self._attr_unique_id = f"{entry.entry_id}_vivino_sync"
+        self._attr_name = "Cork Dork Vivino Cellar"
+
+    def _status(self) -> dict[str, Any] | None:
+        return self._hass.data.get(DOMAIN, {}).get("vivino_sync_status")
+
+    @property
+    def available(self) -> bool:
+        """Only meaningful once a Vivino account is configured."""
+        return "vivino_account" in self._hass.data.get(DOMAIN, {})
+
+    @property
+    def native_value(self) -> int | None:
+        """Return the Vivino cellar bottle count from the last sync."""
+        status = self._status()
+        if not status:
+            return None
+        return status.get("cellar_total")
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return details of the last sync."""
+        status = self._status()
+        if not status:
+            return {"synced": False}
+        return {
+            "synced": True,
+            "last_sync": status.get("last_sync"),
+            "alias": status.get("alias"),
+            "cellar_imported": status.get("cellar_imported"),
+            "wishlist_total": status.get("wishlist_total"),
+            "wishlist_imported": status.get("wishlist_imported"),
+            "errors": status.get("errors", []),
         }
 
 

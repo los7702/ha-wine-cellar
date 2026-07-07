@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -12,9 +13,18 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
 from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.event import async_track_time_interval
 
-from .const import DOMAIN, FRONTEND_VERSION
+from .const import (
+    CONF_VIVINO_AUTO_SYNC,
+    CONF_VIVINO_EMAIL,
+    CONF_VIVINO_PASSWORD,
+    DOMAIN,
+    FRONTEND_VERSION,
+    VIVINO_AUTO_SYNC_INTERVAL_HOURS,
+)
 from .vivino import VivinoClient
+from .vivino_account import VivinoAccountClient, async_sync_from_vivino
 from .websocket import async_register_websocket_commands
 from .wine_storage import WineCellarStorage
 
@@ -113,6 +123,39 @@ def _register_frontend_resource(hass: HomeAssistant) -> None:
         hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, _async_add_resource)
 
 
+def _setup_vivino_account(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Create/remove the Vivino account client and auto-sync timer from options."""
+    domain_data = hass.data.setdefault(DOMAIN, {})
+
+    # Cancel any previous auto-sync timer
+    cancel = domain_data.pop("vivino_auto_sync_unsub", None)
+    if cancel:
+        cancel()
+
+    email = entry.options.get(CONF_VIVINO_EMAIL, "").strip()
+    password = entry.options.get(CONF_VIVINO_PASSWORD, "")
+    if not email or not password:
+        domain_data.pop("vivino_account", None)
+        return
+
+    domain_data["vivino_account"] = VivinoAccountClient(hass, email, password)
+
+    if entry.options.get(CONF_VIVINO_AUTO_SYNC, False):
+        async def _auto_sync(_now: Any) -> None:
+            client = domain_data.get("vivino_account")
+            storage = domain_data.get("storage")
+            if not client or not storage:
+                return
+            try:
+                await async_sync_from_vivino(hass, storage, client)
+            except Exception as err:
+                _LOGGER.warning("Scheduled Vivino sync failed: %s", err)
+
+        domain_data["vivino_auto_sync_unsub"] = async_track_time_interval(
+            hass, _auto_sync, timedelta(hours=VIVINO_AUTO_SYNC_INTERVAL_HOURS)
+        )
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Cork Dork from a config entry."""
     domain_data = hass.data.setdefault(DOMAIN, {})
@@ -149,6 +192,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     domain_data["vivino"] = vivino
     domain_data["entry"] = entry
 
+    # Initialize Vivino account connection if credentials are configured
+    _setup_vivino_account(hass, entry)
+
     # Register services
     await _async_register_services(hass, storage, vivino)
 
@@ -171,6 +217,8 @@ async def _async_options_updated(hass: HomeAssistant, entry: ConfigEntry) -> Non
     else:
         domain_data.pop("gemini", None)
 
+    _setup_vivino_account(hass, entry)
+
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
@@ -178,6 +226,10 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if unload_ok:
         domain_data = hass.data.get(DOMAIN, {})
         # Remove entry-specific data but keep registration flags
+        cancel = domain_data.pop("vivino_auto_sync_unsub", None)
+        if cancel:
+            cancel()
+        domain_data.pop("vivino_account", None)
         domain_data.pop("storage", None)
         domain_data.pop("vivino", None)
         domain_data.pop("entry", None)
@@ -286,9 +338,40 @@ async def _async_register_services(
         }),
     )
 
+    async def handle_sync_vivino(call: ServiceCall) -> None:
+        """Handle Vivino account sync service call."""
+        client = hass.data[DOMAIN].get("vivino_account")
+        if not client:
+            _LOGGER.warning(
+                "Vivino sync requested but no Vivino account is configured. "
+                "Add your credentials via Settings > Integrations > Cork Dork > Configure."
+            )
+            return
+
+        target = call.data.get("target", "all")
+        result = await async_sync_from_vivino(
+            hass,
+            storage,
+            client,
+            sync_cellar=target in ("all", "cellar"),
+            sync_wishlist=target in ("all", "wishlist"),
+        )
+        hass.bus.async_fire(f"{DOMAIN}_vivino_sync_result", result)
+
     hass.services.async_register(
         DOMAIN,
         "scan_barcode",
         handle_scan_barcode,
         schema=vol.Schema({vol.Required("barcode"): cv.string}),
+    )
+
+    hass.services.async_register(
+        DOMAIN,
+        "sync_vivino",
+        handle_sync_vivino,
+        schema=vol.Schema({
+            vol.Optional("target", default="all"): vol.In(
+                ["all", "cellar", "wishlist"]
+            ),
+        }),
     )
