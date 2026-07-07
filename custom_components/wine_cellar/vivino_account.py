@@ -322,9 +322,29 @@ class VivinoAccountClient:
                 break
         return records
 
+    async def _fetch_first_working(self, paths: tuple[str, ...]) -> list[dict[str, Any]]:
+        """Fetch records from the first endpoint variant that responds.
+
+        An endpoint that answers successfully with zero records is a valid
+        outcome (an empty cellar/list) and stops the fallback chain; only
+        rejected/failed endpoints advance to the next variant.
+        """
+        last_err: Exception | None = None
+        for path in paths:
+            try:
+                return await self._fetch_paginated(path)
+            except (VivinoAuthError, RuntimeError) as err:
+                _LOGGER.debug("Vivino endpoint %s failed: %s", path, err)
+                last_err = err
+        if last_err:
+            raise last_err
+        return []
+
     async def async_get_cellar(self) -> list[dict[str, Any]]:
         """Return the user's Vivino cellar as parsed wine dicts."""
-        raw = await self._fetch_paginated(f"users/{self._user_id}/cellar")
+        raw = await self._fetch_first_working(
+            (f"users/{self._user_id}/cellar", "cellars")
+        )
         wines = [w for w in (_parse_user_wine(r) for r in raw) if w]
         _log_parse_outcome("cellar", raw, wines)
         return wines
@@ -343,18 +363,9 @@ class VivinoAccountClient:
         the user has rated or scanned. Two endpoint variants exist; try the
         user-scoped one first.
         """
-        raw: list[dict[str, Any]] = []
-        last_err: Exception | None = None
-        for path in (f"users/{self._user_id}/vintages", "user_vintages"):
-            try:
-                raw = await self._fetch_paginated(path)
-                if raw:
-                    break
-            except (VivinoAuthError, RuntimeError) as err:
-                _LOGGER.debug("My Wines endpoint %s failed: %s", path, err)
-                last_err = err
-        if not raw and last_err:
-            raise last_err
+        raw = await self._fetch_first_working(
+            (f"users/{self._user_id}/vintages", "user_vintages")
+        )
         wines = [w for w in (_parse_user_wine(r) for r in raw) if w]
         _log_parse_outcome("my wines", raw, wines)
         return wines
@@ -626,9 +637,9 @@ async def async_sync_from_vivino(
             ) = _import_wines(cellar, "vivino_cellar")
         except VivinoAuthError as err:
             result["errors"].append(
-                f"Cellar: {err} — the Vivino Wine Cellar is a Vivino Premium "
-                "feature; without it, use the 'my_wines' sync target for your "
-                "rated/scanned wines instead"
+                f"Cellar: {err} — note: your rated/scanned wines still sync "
+                "via the 'my_wines' target, and without a Vivino Premium "
+                "subscription the cellar is not available at all"
             )
         except Exception as err:
             _LOGGER.warning("Vivino cellar sync failed: %s", err)
