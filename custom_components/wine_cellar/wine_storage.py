@@ -145,6 +145,8 @@ class WineCellarStorage:
             "disposition": wine_data.get("disposition", ""),
             "drink_window": wine_data.get("drink_window", ""),
             "ai_ratings": wine_data.get("ai_ratings"),
+            "vivino_id": wine_data.get("vivino_id", ""),
+            "source": wine_data.get("source", ""),
             "added_at": datetime.now(timezone.utc).isoformat(),
         }
         self._data[CONF_WINES].append(wine)
@@ -331,6 +333,8 @@ class WineCellarStorage:
             "ai_ratings": wine_data.get("ai_ratings"),
             "disposition": wine_data.get("disposition", ""),
             "drink_window": wine_data.get("drink_window", ""),
+            "vivino_id": wine_data.get("vivino_id", ""),
+            "source": wine_data.get("source", ""),
             "added_at": datetime.now(timezone.utc).isoformat(),
         }
         self._data.setdefault(CONF_BUY_LIST, []).append(item)

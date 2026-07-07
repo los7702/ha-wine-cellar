@@ -66,6 +66,11 @@ A custom Home Assistant integration for managing your wine collection. Track bot
 - **Auto-Enrich on Add** — When you add a wine, Vivino data (rating, price, description, food pairings) is automatically fetched in the background
 
 ### Vivino Integration
+- **Vivino Account Connection** — Link your Vivino account (email + password in the integration options) to connect your Vivino wine cellar
+- **Cellar Sync** — One-tap 🔄 Vivino Sync imports every bottle from your Vivino cellar (with ratings, images, region, and grape data) as unassigned wines ready to be placed in your racks. Bottle counts are respected and already-imported bottles are never duplicated.
+- **Wishlist Sync** — Your Vivino wishlist is imported into the Cork Dork buy list (skipping wines already in your cellar)
+- **Auto Sync** — Optionally sync from Vivino automatically twice a day
+- **Sync Service & Sensor** — `wine_cellar.sync_vivino` service for automations plus a `Cork Dork Vivino Cellar` sensor reporting the last sync
 - **Vivino Batch Scan** — Refresh all wines from Vivino in one click: ratings, review counts, market pricing, descriptions, food pairings, alcohol content, and grape variety. Falls back to Gemini AI pricing when Vivino has no price.
 - **Individual Vivino Refresh** — Update any single wine's Vivino data from the detail dialog
 - **Wine Search** — Search Vivino by name to find and add wines without a barcode
@@ -126,6 +131,17 @@ To enable label recognition, AI analysis, wine list scanning, and batch AI scann
    - **Scan List** button to photograph wine lists and receipts for instant analysis
    - **Gemini price fallback** when Vivino has no pricing data
 
+### Vivino Account Sync (Optional)
+
+To connect your Vivino wine cellar and wishlist:
+
+1. Go to **Settings > Devices & Services > Cork Dork > Configure**
+2. Enter your Vivino account email and password (optionally enable auto-sync)
+3. A **🔄 Vivino Sync** button appears in the card header — tap it to import your Vivino cellar (as unassigned wines) and wishlist (into the buy list)
+4. Or call the `wine_cellar.sync_vivino` service from automations
+
+> **Note:** Vivino has no official public API. The sync uses the same endpoints as the Vivino web app and may break if Vivino changes them. Credentials are stored in your Home Assistant config entry and only ever sent to vivino.com.
+
 ## Default Cabinet Layout
 
 The integration ships with 3 cabinet sections, each with 10 rows and 9 columns (90 slots per section, 270 total). The bottom row of each section defaults to a bulk bin storage zone. Rack dimensions (up to 20×20), names, depth (1-6 bottles deep), and per-row storage types (Slots, Bulk Bin, Wine Box) can all be customized through the **Manage Racks** button in the tab bar.
@@ -147,6 +163,7 @@ The integration ships with 3 cabinet sections, each with 10 rows and 9 columns (
 | `wine_cellar.remove_wine` | Remove a wine bottle (optional reason: drank, gifted, sold, broken, spoiled, other) |
 | `wine_cellar.move_wine` | Move a wine to a different cabinet/position |
 | `wine_cellar.scan_barcode` | Look up a barcode and fire a result event |
+| `wine_cellar.sync_vivino` | Import your Vivino cellar and wishlist (target: all, cellar, or wishlist) |
 
 ## Sensors
 
@@ -155,6 +172,7 @@ The integration ships with 3 cabinet sections, each with 10 rows and 9 columns (
 | `sensor.wine_cellar_total_bottles` | Total number of bottles in your cellar |
 | `sensor.wine_cellar_capacity` | Percentage of cellar capacity used |
 | `sensor.wine_cellar_cabinet_*_count` | Bottle count per cabinet section |
+| `sensor.cork_dork_vivino_cellar` | Bottles in your Vivino cellar at last sync (with sync details as attributes) |
 
 ## License
 

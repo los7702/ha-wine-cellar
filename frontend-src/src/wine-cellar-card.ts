@@ -38,8 +38,10 @@ export class WineCellarCard extends LitElement {
   @state() private _movingWine: Wine | null = null;
   @state() private _analyzing = false;
   @state() private _batchVivino = false;
+  @state() private _vivinoSyncing = false;
   @state() private _toast = "";
   @state() private _hasGemini = false;
+  @state() private _hasVivinoAccount = false;
   @state() private _showWineList = false;
   @state() private _showInventory = false;
   @state() private _buyList: Wine[] = [];
@@ -406,6 +408,7 @@ export class WineCellarCard extends LitElement {
       );
       this._stats = statsResult;
       this._hasGemini = capResult?.has_gemini || false;
+      this._hasVivinoAccount = capResult?.has_vivino_account || false;
       this._buyList = buyListResult?.buy_list || [];
 
       // Refresh selected wine if detail dialog is open
@@ -796,6 +799,31 @@ export class WineCellarCard extends LitElement {
     this._batchVivino = false;
   }
 
+  // --- Vivino Account Sync ---
+  private async _syncVivino() {
+    this._vivinoSyncing = true;
+    this._showToast("Syncing your Vivino cellar & wishlist...");
+    try {
+      const result = await this.hass.callWS({
+        type: "wine_cellar/sync_vivino",
+      });
+      if (result.error) {
+        this._showToast(`Vivino sync failed: ${result.error}`);
+      } else {
+        const parts = [
+          `Vivino sync complete! ${result.cellar_imported} bottle${result.cellar_imported === 1 ? "" : "s"} imported`,
+        ];
+        if (result.wishlist_imported > 0) parts.push(`+ ${result.wishlist_imported} to buy list`);
+        if (result.errors?.length) parts.push(`(${result.errors.length} errors)`);
+        this._showToast(parts.join(" "));
+        await this._loadData();
+      }
+    } catch (err: any) {
+      this._showToast("Vivino sync failed.");
+    }
+    this._vivinoSyncing = false;
+  }
+
   // --- Buy List ---
   private _showBuyListDetail(item: Wine) {
     this._selectedWine = item;
@@ -920,6 +948,17 @@ export class WineCellarCard extends LitElement {
             >
               ${this._batchVivino ? "Vivino Scanning..." : "🍇 Vivino Batch Scan"}
             </button>
+            ${this._hasVivinoAccount ? html`
+              <button
+                class="btn btn-primary"
+                style="font-size: 0.8em; padding: 5px 10px; background: #b71c1c;"
+                @click=${this._syncVivino}
+                title="Import your Vivino cellar and wishlist into Cork Dork"
+                ?disabled=${this._vivinoSyncing || this._batchVivino || this._analyzing}
+              >
+                ${this._vivinoSyncing ? "Vivino Syncing..." : "🔄 Vivino Sync"}
+              </button>
+            ` : nothing}
             ${this._hasGemini ? html`
               <button
                 class="btn btn-primary"
