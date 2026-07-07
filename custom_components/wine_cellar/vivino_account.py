@@ -81,6 +81,9 @@ class VivinoAccountClient:
         # True once a freshly logged-in session was still rejected; stops
         # every subsequent request from hammering the login endpoint again.
         self._session_rejected = False
+        # Ground-truth about the last login/token resolution, surfaced in the
+        # sync result so auth problems can be diagnosed without log-diving.
+        self.token_diagnostics: dict[str, Any] = {}
 
     @property
     def user_id(self) -> int | None:
@@ -180,23 +183,42 @@ class VivinoAccountClient:
         discard an otherwise-good token.
         """
         candidates: list[str] = []
+        sources: list[str] = []
 
-        def _add(token: str | None) -> None:
+        def _add(token: str | None, source: str) -> None:
             if token and token not in candidates:
                 candidates.append(token)
+                sources.append(source)
 
         for token in self._extract_tokens(data):
-            _add(token)
-        _add(await self._async_scrape_token())
+            _add(token, "login")
+        _add(await self._async_scrape_token(), "page")
         for token in self._cookie_tokens():
-            _add(token)
+            _add(token, "cookie")
+
+        # Record what we found, without leaking token values
+        self.token_diagnostics = {
+            "login_response_keys": sorted(data.keys()),
+            "candidate_count": len(candidates),
+            "candidate_sources": sources,
+            "validated": False,
+            "validated_source": None,
+            "probe_status": None,
+        }
 
         if not candidates:
             return None
 
-        for token in candidates:
-            if await self._async_token_works(token):
-                _LOGGER.debug("Validated Vivino API token (%d candidates)", len(candidates))
+        for token, source in zip(candidates, sources):
+            status = await self._async_token_probe_status(token)
+            self.token_diagnostics["probe_status"] = status
+            if status == 200:
+                self.token_diagnostics["validated"] = True
+                self.token_diagnostics["validated_source"] = source
+                _LOGGER.debug(
+                    "Validated Vivino API token from %s (%d candidates)",
+                    source, len(candidates),
+                )
                 return token
 
         _LOGGER.debug(
@@ -204,8 +226,8 @@ class VivinoAccountClient:
         )
         return candidates[0]
 
-    async def _async_token_works(self, token: str) -> bool:
-        """Probe a token against the user endpoint; True if accepted."""
+    async def _async_token_probe_status(self, token: str) -> int | None:
+        """Probe a token against the user endpoint; return the status code."""
         session = self._get_session()
         headers = {**HEADERS, "Authorization": f"Bearer {token}"}
         try:
@@ -213,10 +235,10 @@ class VivinoAccountClient:
                 f"{API_BASE}/users/{self._user_id}",
                 headers=headers, timeout=REQUEST_TIMEOUT,
             ) as resp:
-                return resp.status == 200
+                return resp.status
         except Exception as err:
             _LOGGER.debug("Token probe failed: %s", err)
-            return False
+            return None
 
     def _cookie_tokens(self) -> list[str]:
         """Return token-like values from the session cookie jar."""
@@ -736,6 +758,7 @@ async def async_sync_from_vivino(
     result["last_sync"] = datetime.now(timezone.utc).isoformat()
     result["user_id"] = client.user_id
     result["alias"] = client.alias
+    result["auth"] = client.token_diagnostics
 
     # Persist the result so the sync sensor survives restarts
     storage.set_vivino_sync_status(result)
