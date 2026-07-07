@@ -67,7 +67,8 @@ A custom Home Assistant integration for managing your wine collection. Track bot
 
 ### Vivino Integration
 - **Vivino Account Connection** — Link your Vivino account (email + password in the integration options) to connect your Vivino wine cellar
-- **Cellar Sync** — One-tap 🔄 Vivino Sync imports every bottle from your Vivino cellar (with ratings, images, region, and grape data) as unassigned wines ready to be placed in your racks. Bottle counts are respected and already-imported bottles are never duplicated.
+- **Cellar Sync** — One-tap 🔄 Vivino Sync imports every bottle from your Vivino cellar (with ratings, images, region, and grape data) as unassigned wines ready to be placed in your racks. Bottle counts are respected and already-imported bottles are never duplicated. Note: the Vivino Wine Cellar is a Vivino Premium feature.
+- **My Wines Sync** — No Premium? The sync also imports your Vivino "My Wines" (every wine you've rated or scanned), including your personal star rating and review note.
 - **Wishlist Sync** — Your Vivino wishlist is imported into the Cork Dork buy list (skipping wines already in your cellar)
 - **Auto Sync** — Optionally sync from Vivino automatically twice a day
 - **Sync Service & Sensor** — `wine_cellar.sync_vivino` service for automations plus a `Cork Dork Vivino Cellar` sensor reporting the last sync

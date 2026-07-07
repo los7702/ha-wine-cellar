@@ -119,7 +119,10 @@ sync_vivino:
   fields:
     target:
       name: Target
-      description: What to sync from your Vivino account
+      description: >-
+        What to sync from your Vivino account. "cellar" is the Vivino Premium
+        Wine Cellar; "my_wines" is every wine you have rated or scanned;
+        "wishlist" goes to the buy list. "all" syncs everything available.
       default: all
       selector:
         select:
@@ -127,3 +130,4 @@ sync_vivino:
             - all
             - cellar
             - wishlist
+            - my_wines

@@ -810,8 +810,9 @@ export class WineCellarCard extends LitElement {
       if (result.error) {
         this._showToast(`Vivino sync failed: ${result.error}`);
       } else {
+        const bottles = (result.cellar_imported || 0) + (result.my_wines_imported || 0);
         const parts = [
-          `Vivino sync complete! ${result.cellar_imported} bottle${result.cellar_imported === 1 ? "" : "s"} imported`,
+          `Vivino sync complete! ${bottles} bottle${bottles === 1 ? "" : "s"} imported`,
         ];
         if (result.wishlist_imported > 0) parts.push(`+ ${result.wishlist_imported} to buy list`);
         if (result.errors?.length) parts.push(`(${result.errors.length} errors)`);

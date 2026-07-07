@@ -130,11 +130,13 @@ class WineCellarVivinoSyncSensor(SensorEntity):
 
     @property
     def native_value(self) -> int | None:
-        """Return the Vivino cellar bottle count from the last sync."""
+        """Return the bottles seen on Vivino (cellar + My Wines) at last sync."""
         status = self._status()
         if not status:
             return None
-        return status.get("cellar_total")
+        return (status.get("cellar_total") or 0) + (
+            status.get("my_wines_total") or 0
+        )
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
@@ -146,7 +148,10 @@ class WineCellarVivinoSyncSensor(SensorEntity):
             "synced": True,
             "last_sync": status.get("last_sync"),
             "alias": status.get("alias"),
+            "cellar_total": status.get("cellar_total"),
             "cellar_imported": status.get("cellar_imported"),
+            "my_wines_total": status.get("my_wines_total"),
+            "my_wines_imported": status.get("my_wines_imported"),
             "wishlist_total": status.get("wishlist_total"),
             "wishlist_imported": status.get("wishlist_imported"),
             "errors": status.get("errors", []),
