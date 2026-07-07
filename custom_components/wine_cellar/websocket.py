@@ -1283,13 +1283,19 @@ def ws_vivino_status(
     """Return Vivino account connection status and last sync result."""
     domain_data = hass.data.get(DOMAIN, {})
     client = domain_data.get("vivino_account")
+    storage = domain_data.get("storage")
+    last_sync = None
+    if storage:
+        last_sync = storage.get_vivino_sync_status()
+    if not last_sync:
+        last_sync = domain_data.get("vivino_sync_status")
     connection.send_result(
         msg["id"],
         {
             "configured": client is not None,
             "user_id": client.user_id if client else None,
             "alias": client.alias if client else "",
-            "last_sync": domain_data.get("vivino_sync_status"),
+            "last_sync": last_sync,
         },
     )
 

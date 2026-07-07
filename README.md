@@ -136,7 +136,7 @@ To enable label recognition, AI analysis, wine list scanning, and batch AI scann
 To connect your Vivino wine cellar and wishlist:
 
 1. Go to **Settings > Devices & Services > Cork Dork > Configure**
-2. Enter your Vivino account email and password (optionally enable auto-sync)
+2. Enter your Vivino account email and password (optionally enable auto-sync). The credentials are verified against Vivino when you save — the form shows an error if the sign-in fails.
 3. A **🔄 Vivino Sync** button appears in the card header — tap it to import your Vivino cellar (as unassigned wines) and wishlist (into the buy list)
 4. Or call the `wine_cellar.sync_vivino` service from automations
 

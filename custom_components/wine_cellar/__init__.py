@@ -12,6 +12,7 @@ import voluptuous as vol
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
 from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.event import async_track_time_interval
 
@@ -342,11 +343,11 @@ async def _async_register_services(
         """Handle Vivino account sync service call."""
         client = hass.data[DOMAIN].get("vivino_account")
         if not client:
-            _LOGGER.warning(
-                "Vivino sync requested but no Vivino account is configured. "
-                "Add your credentials via Settings > Integrations > Cork Dork > Configure."
+            # Raise so the service call fails visibly instead of silently no-oping
+            raise HomeAssistantError(
+                "No Vivino account is configured. Add your Vivino email and "
+                "password via Settings > Devices & Services > Cork Dork > Configure."
             )
-            return
 
         target = call.data.get("target", "all")
         result = await async_sync_from_vivino(
