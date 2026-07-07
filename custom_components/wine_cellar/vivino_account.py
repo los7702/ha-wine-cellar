@@ -16,6 +16,7 @@ ignored rather than raising.
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -140,14 +141,52 @@ class VivinoAccountClient:
                 "Vivino login succeeded but no user id was returned"
             )
         if not self._token:
+            # The login cookies are host-only for www.vivino.com and are not
+            # sent to api.vivino.com, so without a Bearer token user data is
+            # unreachable. The web app embeds the token in its pages — fetch
+            # one with the fresh login cookies and extract it.
             _LOGGER.debug(
                 "Vivino login response had no token field (keys: %s); "
-                "falling back to cookie session",
+                "scraping token from the web app",
                 list(data.keys()),
             )
+            self._token = await self._async_scrape_token()
+            if not self._token:
+                _LOGGER.warning(
+                    "Vivino login succeeded but no API token could be "
+                    "obtained; cellar/wishlist requests will likely fail"
+                )
 
-        _LOGGER.debug("Logged in to Vivino as user %s (%s)", self._user_id, self.alias)
+        _LOGGER.debug(
+            "Logged in to Vivino as user %s (%s), token: %s",
+            self._user_id, self.alias, "yes" if self._token else "no",
+        )
         return user
+
+    async def _async_scrape_token(self) -> str | None:
+        """Extract the API bearer token from a logged-in Vivino web page."""
+        session = self._get_session()
+        headers = {**HEADERS, "Accept": "text/html"}
+        for url in ("https://www.vivino.com/wines", "https://www.vivino.com/"):
+            try:
+                async with session.get(
+                    url, headers=headers, timeout=REQUEST_TIMEOUT,
+                    allow_redirects=True,
+                ) as resp:
+                    if resp.status != 200:
+                        continue
+                    html = await resp.text()
+                match = re.search(
+                    r'"(?:api_token|apiToken|access_token|accessToken)"'
+                    r'\s*:\s*"([A-Za-z0-9._\-]{20,})"',
+                    html,
+                )
+                if match:
+                    _LOGGER.debug("Scraped Vivino API token from %s", url)
+                    return match.group(1)
+            except Exception as err:
+                _LOGGER.debug("Token scrape from %s failed: %s", url, err)
+        return None
 
     @staticmethod
     def _extract_token(data: dict[str, Any]) -> str | None:

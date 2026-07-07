@@ -11,7 +11,12 @@ import voluptuous as vol
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
-from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.core import (
+    HomeAssistant,
+    ServiceCall,
+    ServiceResponse,
+    SupportsResponse,
+)
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.event import async_track_time_interval
@@ -339,7 +344,7 @@ async def _async_register_services(
         }),
     )
 
-    async def handle_sync_vivino(call: ServiceCall) -> None:
+    async def handle_sync_vivino(call: ServiceCall) -> ServiceResponse:
         """Handle Vivino account sync service call."""
         client = hass.data[DOMAIN].get("vivino_account")
         if not client:
@@ -359,6 +364,21 @@ async def _async_register_services(
         )
         hass.bus.async_fire(f"{DOMAIN}_vivino_sync_result", result)
 
+        # If every section failed and nothing came back, surface the failure
+        # in the service call itself instead of burying it in attributes.
+        nothing_synced = not (
+            result["cellar_total"] or result["wishlist_total"]
+            or result["cellar_imported"] or result["wishlist_imported"]
+        )
+        if result["errors"] and nothing_synced:
+            raise HomeAssistantError(
+                "Vivino sync failed: " + "; ".join(result["errors"])
+            )
+
+        if call.return_response:
+            return result
+        return None
+
     hass.services.async_register(
         DOMAIN,
         "scan_barcode",
@@ -375,4 +395,5 @@ async def _async_register_services(
                 ["all", "cellar", "wishlist"]
             ),
         }),
+        supports_response=SupportsResponse.OPTIONAL,
     )
