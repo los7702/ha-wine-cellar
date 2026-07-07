@@ -140,7 +140,6 @@ class VivinoAccountClient:
             ) from err
 
         user = data.get("user") if isinstance(data.get("user"), dict) else data
-        self._token = self._extract_token(data)
         user_id = user.get("id") or data.get("id") or data.get("user_id")
         if isinstance(user_id, int):
             self._user_id = user_id
@@ -150,22 +149,19 @@ class VivinoAccountClient:
             raise VivinoAuthError(
                 "Vivino login succeeded but no user id was returned"
             )
+
+        # A Vivino login can hand back several token-like fields, and only
+        # some are valid Bearer tokens for api.vivino.com. Rather than guess
+        # which field/source is right, collect every candidate and use the
+        # first one that actually authenticates against a probe endpoint.
+        self._token = await self._async_resolve_token(data)
         if not self._token:
-            # The login cookies are host-only for www.vivino.com and are not
-            # sent to api.vivino.com, so without a Bearer token user data is
-            # unreachable. The web app embeds the token in its pages — fetch
-            # one with the fresh login cookies and extract it.
-            _LOGGER.debug(
-                "Vivino login response had no token field (keys: %s); "
-                "scraping token from the web app",
+            _LOGGER.warning(
+                "Vivino login succeeded but no working API token was found "
+                "(login response keys: %s); cellar/wishlist requests will "
+                "be rejected",
                 list(data.keys()),
             )
-            self._token = await self._async_scrape_token()
-            if not self._token:
-                _LOGGER.warning(
-                    "Vivino login succeeded but no API token could be "
-                    "obtained; cellar/wishlist requests will likely fail"
-                )
 
         _LOGGER.debug(
             "Logged in to Vivino as user %s (%s), token: %s",
@@ -173,20 +169,69 @@ class VivinoAccountClient:
         )
         return user
 
+    async def _async_resolve_token(self, data: dict[str, Any]) -> str | None:
+        """Return the first candidate token that authenticates, or None.
+
+        Candidates are gathered from the login response fields, then the
+        logged-in web app pages, then session cookies. Each is probed against
+        the user endpoint; the first that returns 200 wins. If none can be
+        validated (e.g. Vivino is rate-limiting), fall back to the
+        highest-priority candidate so a transient probe failure doesn't
+        discard an otherwise-good token.
+        """
+        candidates: list[str] = []
+
+        def _add(token: str | None) -> None:
+            if token and token not in candidates:
+                candidates.append(token)
+
+        for token in self._extract_tokens(data):
+            _add(token)
+        _add(await self._async_scrape_token())
+        for token in self._cookie_tokens():
+            _add(token)
+
+        if not candidates:
+            return None
+
+        for token in candidates:
+            if await self._async_token_works(token):
+                _LOGGER.debug("Validated Vivino API token (%d candidates)", len(candidates))
+                return token
+
+        _LOGGER.debug(
+            "No Vivino token could be validated; using best-effort candidate"
+        )
+        return candidates[0]
+
+    async def _async_token_works(self, token: str) -> bool:
+        """Probe a token against the user endpoint; True if accepted."""
+        session = self._get_session()
+        headers = {**HEADERS, "Authorization": f"Bearer {token}"}
+        try:
+            async with session.get(
+                f"{API_BASE}/users/{self._user_id}",
+                headers=headers, timeout=REQUEST_TIMEOUT,
+            ) as resp:
+                return resp.status == 200
+        except Exception as err:
+            _LOGGER.debug("Token probe failed: %s", err)
+            return False
+
+    def _cookie_tokens(self) -> list[str]:
+        """Return token-like values from the session cookie jar."""
+        tokens: list[str] = []
+        try:
+            for cookie in self._get_session().cookie_jar:
+                if "token" in cookie.key.lower() and len(cookie.value) > 20:
+                    tokens.append(cookie.value)
+        except Exception as err:
+            _LOGGER.debug("Cookie jar token scan failed: %s", err)
+        return tokens
+
     async def _async_scrape_token(self) -> str | None:
         """Extract the API bearer token from a logged-in Vivino web page."""
         session = self._get_session()
-
-        # Cheapest first: the login may have set a token-bearing cookie
-        try:
-            for cookie in session.cookie_jar:
-                name = cookie.key.lower()
-                if "token" in name and len(cookie.value) > 20:
-                    _LOGGER.debug("Using Vivino token from cookie %s", cookie.key)
-                    return cookie.value
-        except Exception as err:
-            _LOGGER.debug("Cookie jar token scan failed: %s", err)
-
         headers = {**HEADERS, "Accept": "text/html"}
         for url in ("https://www.vivino.com/wines", "https://www.vivino.com/"):
             try:
@@ -211,19 +256,20 @@ class VivinoAccountClient:
         return None
 
     @staticmethod
-    def _extract_token(data: dict[str, Any]) -> str | None:
-        """Find an API token in the login response, wherever Vivino put it."""
-        candidates: list[dict[str, Any]] = [data]
+    def _extract_tokens(data: dict[str, Any]) -> list[str]:
+        """Return all token-like values from the login response, in order."""
+        tokens: list[str] = []
+        containers: list[dict[str, Any]] = [data]
         for key in ("user", "session", "auth"):
             nested = data.get(key)
             if isinstance(nested, dict):
-                candidates.append(nested)
-        for container in candidates:
+                containers.append(nested)
+        for container in containers:
             for key in _TOKEN_KEYS:
                 token = container.get(key)
-                if isinstance(token, str) and len(token) > 10:
-                    return token
-        return None
+                if isinstance(token, str) and len(token) > 10 and token not in tokens:
+                    tokens.append(token)
+        return tokens
 
     async def async_verify(self) -> dict[str, Any]:
         """Verify credentials work; returns the user profile."""
@@ -636,11 +682,7 @@ async def async_sync_from_vivino(
                 result["cellar_skipped_no_bottles"],
             ) = _import_wines(cellar, "vivino_cellar")
         except VivinoAuthError as err:
-            result["errors"].append(
-                f"Cellar: {err} — note: your rated/scanned wines still sync "
-                "via the 'my_wines' target, and without a Vivino Premium "
-                "subscription the cellar is not available at all"
-            )
+            result["errors"].append(f"Cellar: {err}")
         except Exception as err:
             _LOGGER.warning("Vivino cellar sync failed: %s", err)
             result["errors"].append(f"Cellar: {err}")
