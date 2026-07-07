@@ -368,6 +368,16 @@ class WineCellarStorage:
                 return item
         return None
 
+    # ── Vivino Sync Status ───────────────────────────────────────────
+
+    def get_vivino_sync_status(self) -> dict[str, Any] | None:
+        """Return the last Vivino sync result, if any."""
+        return self._data.get("vivino_sync_status")
+
+    def set_vivino_sync_status(self, status: dict[str, Any]) -> None:
+        """Store the last Vivino sync result (persisted across restarts)."""
+        self._data["vivino_sync_status"] = status
+
     # ── Backup / Restore ─────────────────────────────────────────────
 
     def get_backup_data(self) -> dict[str, Any]:

@@ -206,6 +206,16 @@ class VivinoAccountClient:
             )
             batch = _extract_records(data)
             if not batch:
+                if page == 1 and data:
+                    # Response wasn't empty but had no recognizable record
+                    # list — log its shape so parse failures are diagnosable.
+                    _LOGGER.warning(
+                        "Vivino %s response had no recognizable records "
+                        "(type: %s, keys: %s)",
+                        path,
+                        type(data).__name__,
+                        list(data.keys()) if isinstance(data, dict) else "n/a",
+                    )
                 break
             records.extend(batch)
             if len(batch) < PAGE_SIZE:
@@ -216,18 +226,32 @@ class VivinoAccountClient:
         """Return the user's Vivino cellar as parsed wine dicts."""
         raw = await self._fetch_paginated(f"users/{self._user_id}/cellar")
         wines = [w for w in (_parse_user_wine(r) for r in raw) if w]
-        _LOGGER.debug("Fetched %d cellar wines from Vivino", len(wines))
+        _log_parse_outcome("cellar", raw, wines)
         return wines
 
     async def async_get_wishlist(self) -> list[dict[str, Any]]:
         """Return the user's Vivino wishlist as parsed wine dicts."""
         raw = await self._fetch_paginated(f"users/{self._user_id}/wishlist")
         wines = [w for w in (_parse_user_wine(r) for r in raw) if w]
-        _LOGGER.debug("Fetched %d wishlist wines from Vivino", len(wines))
+        _log_parse_outcome("wishlist", raw, wines)
         return wines
 
 
 # ── Response parsing ─────────────────────────────────────────────────
+
+
+def _log_parse_outcome(
+    what: str, raw: list[dict[str, Any]], wines: list[dict[str, Any]]
+) -> None:
+    """Log fetch results, loudly when records existed but none parsed."""
+    if raw and not wines:
+        _LOGGER.warning(
+            "Vivino %s returned %d records but none could be parsed; "
+            "first record keys: %s — please report this structure",
+            what, len(raw), list(raw[0].keys()),
+        )
+    else:
+        _LOGGER.debug("Fetched %d %s wines from Vivino", len(wines), what)
 
 
 def _extract_records(data: Any) -> list[dict[str, Any]]:
@@ -450,12 +474,13 @@ async def async_sync_from_vivino(
             _LOGGER.warning("Vivino wishlist sync failed: %s", err)
             result["errors"].append(f"Wishlist: {err}")
 
-    if result["cellar_imported"] or result["wishlist_imported"]:
-        await storage.async_save()
-
     result["last_sync"] = datetime.now(timezone.utc).isoformat()
     result["user_id"] = client.user_id
     result["alias"] = client.alias
+
+    # Persist the result so the sync sensor survives restarts
+    storage.set_vivino_sync_status(result)
+    await storage.async_save()
     hass.data.setdefault(DOMAIN, {})["vivino_sync_status"] = result
 
     # Always fire so the card and the Vivino sync sensor refresh

@@ -115,7 +115,13 @@ class WineCellarVivinoSyncSensor(SensorEntity):
         self._attr_name = "Cork Dork Vivino Cellar"
 
     def _status(self) -> dict[str, Any] | None:
-        return self._hass.data.get(DOMAIN, {}).get("vivino_sync_status")
+        domain_data = self._hass.data.get(DOMAIN, {})
+        storage = domain_data.get("storage")
+        if storage:
+            status = storage.get_vivino_sync_status()
+            if status:
+                return status
+        return domain_data.get("vivino_sync_status")
 
     @property
     def available(self) -> bool:
