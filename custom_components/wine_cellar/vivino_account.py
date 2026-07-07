@@ -45,7 +45,10 @@ HEADERS = {
 }
 
 # Keys that may hold the API token in the login response
-_TOKEN_KEYS = ("token", "api_token", "access_token", "jwt")
+_TOKEN_KEYS = (
+    "token", "api_token", "access_token", "jwt",
+    "oauth_token", "bearer_token", "session_token",
+)
 # Keys that may hold the record list in cellar/wishlist responses
 _LIST_KEYS = (
     "cellar", "cellar_wines", "user_cellar", "wishlist", "user_wines",
@@ -75,11 +78,18 @@ class VivinoAccountClient:
         self._token: str | None = None
         self._user_id: int | None = None
         self.alias: str = ""
+        # True once a freshly logged-in session was still rejected; stops
+        # every subsequent request from hammering the login endpoint again.
+        self._session_rejected = False
 
     @property
     def user_id(self) -> int | None:
         """Return the Vivino user ID once logged in."""
         return self._user_id
+
+    def reset_session_backoff(self) -> None:
+        """Allow one fresh re-login attempt (called at the start of a sync)."""
+        self._session_rejected = False
 
     def _get_session(self) -> aiohttp.ClientSession:
         """Return the dedicated aiohttp session, creating it if needed."""
@@ -166,6 +176,17 @@ class VivinoAccountClient:
     async def _async_scrape_token(self) -> str | None:
         """Extract the API bearer token from a logged-in Vivino web page."""
         session = self._get_session()
+
+        # Cheapest first: the login may have set a token-bearing cookie
+        try:
+            for cookie in session.cookie_jar:
+                name = cookie.key.lower()
+                if "token" in name and len(cookie.value) > 20:
+                    _LOGGER.debug("Using Vivino token from cookie %s", cookie.key)
+                    return cookie.value
+        except Exception as err:
+            _LOGGER.debug("Cookie jar token scan failed: %s", err)
+
         headers = {**HEADERS, "Accept": "text/html"}
         for url in ("https://www.vivino.com/wines", "https://www.vivino.com/"):
             try:
@@ -177,7 +198,8 @@ class VivinoAccountClient:
                         continue
                     html = await resp.text()
                 match = re.search(
-                    r'"(?:api_token|apiToken|access_token|accessToken)"'
+                    r'"(?:api_token|apiToken|access_token|accessToken'
+                    r'|oauth_token|oauthToken|bearer_token|bearerToken)"'
                     r'\s*:\s*"([A-Za-z0-9._\-]{20,})"',
                     html,
                 )
@@ -220,13 +242,18 @@ class VivinoAccountClient:
             if self._token:
                 headers["Authorization"] = f"Bearer {self._token}"
 
+            had_token = self._token is not None
             async with session.get(
                 f"{API_BASE}/{path.lstrip('/')}",
                 params=params,
                 headers=headers,
                 timeout=REQUEST_TIMEOUT,
             ) as resp:
-                if resp.status in (401, 403) and attempt == 1:
+                if (
+                    resp.status in (401, 403)
+                    and attempt == 1
+                    and not self._session_rejected
+                ):
                     _LOGGER.debug(
                         "Vivino API %s returned %s, re-authenticating",
                         path, resp.status,
@@ -235,14 +262,38 @@ class VivinoAccountClient:
                     await self.async_login()
                     continue
                 if resp.status in (401, 403):
+                    self._session_rejected = True
+                    # Include everything needed to diagnose remotely: did we
+                    # even have a token, and what did Vivino answer?
+                    server_msg = ""
+                    try:
+                        body = await resp.json(content_type=None)
+                        err = body.get("error") if isinstance(body, dict) else None
+                        if isinstance(err, dict):
+                            server_msg = err.get("message", "")
+                        elif isinstance(err, str):
+                            server_msg = err
+                    except Exception:
+                        pass
+                    detail = f"HTTP {resp.status}"
+                    detail += ", bearer token attached" if had_token else (
+                        ", NO bearer token available"
+                    )
+                    if server_msg:
+                        detail += f", Vivino says: {server_msg!r}"
                     raise VivinoAuthError(
-                        f"Vivino rejected the session for {path} "
-                        f"(HTTP {resp.status})"
+                        f"Vivino rejected the session for {path} ({detail})"
+                    )
+                if resp.status == 429:
+                    raise RuntimeError(
+                        f"Vivino is rate-limiting requests ({path} returned "
+                        "HTTP 429) — wait a while before syncing again"
                     )
                 if resp.status != 200:
                     raise RuntimeError(
                         f"Vivino API {path} returned HTTP {resp.status}"
                     )
+                self._session_rejected = False
                 return await resp.json(content_type=None)
         return None
 
@@ -512,6 +563,8 @@ async def async_sync_from_vivino(
         "my_wines_skipped_no_bottles": 0,
         "errors": [],
     }
+
+    client.reset_session_backoff()
 
     # Shared bookkeeping of what's already in the local cellar, so cellar
     # and My Wines imports in the same run dedupe against each other too.
