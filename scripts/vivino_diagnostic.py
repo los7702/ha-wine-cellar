@@ -231,8 +231,8 @@ async def main() -> int:
         auth = {**H, "Authorization": f"Bearer {working}"} if working else H
         for path in (f"users/{uid}/cellar", "cellars", f"users/{uid}/vintages", f"users/{uid}/wishlist"):
             st6, b6 = await probe(s, "GET", f"{API}/{path}", headers=auth, params={"page": 1, "limit": 5})
-            shape = structure(b6) if isinstance(b6, (dict, list)) else b6
-            print(f"    GET api/{path} -> {st6}; shape={shape}")
+            shp = structure(b6) if isinstance(b6, (dict, list)) else b6
+            print(f"    GET api/{path} -> {st6}; shape={shp}")
             # If we got records, show the first record's nested keys to fix parsing
             if isinstance(b6, dict) and st6 == 200:
                 for lk in ("cellar", "wishlist", "user_vintages", "vintages", "records", "items"):
