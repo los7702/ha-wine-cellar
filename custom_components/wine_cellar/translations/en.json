@@ -15,6 +15,7 @@
     "step": {
       "init": {
         "title": "Cork Dork Options",
+        "description": "Vivino credentials are verified against Vivino when you save.",
         "data": {
           "default_wine_type": "Default wine type for new entries",
           "gemini_api_key": "Google Gemini API key (for AI label recognition)",
@@ -23,6 +24,11 @@
           "vivino_auto_sync": "Automatically sync Vivino cellar twice a day"
         }
       }
+    },
+    "error": {
+      "vivino_invalid_auth": "Vivino sign-in failed — check your email and password.",
+      "vivino_cannot_connect": "Could not reach Vivino — check your network connection and try again.",
+      "vivino_incomplete": "Enter both a Vivino email and password, or leave both empty to disable the connection."
     }
   }
 }

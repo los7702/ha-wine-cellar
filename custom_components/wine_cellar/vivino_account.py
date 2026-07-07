@@ -56,6 +56,10 @@ class VivinoAuthError(Exception):
     """Raised when Vivino login fails or the session is rejected."""
 
 
+class VivinoConnectionError(Exception):
+    """Raised when Vivino cannot be reached (network/server trouble)."""
+
+
 class VivinoAccountClient:
     """Authenticated client for a user's Vivino account."""
 
@@ -102,6 +106,10 @@ class VivinoAccountClient:
                 except ValueError:
                     data = {}
 
+                if resp.status >= 500:
+                    raise VivinoConnectionError(
+                        f"Vivino is unreachable (HTTP {resp.status})"
+                    )
                 if resp.status != 200 or not isinstance(data, dict):
                     message = ""
                     if isinstance(data, dict):
@@ -113,10 +121,12 @@ class VivinoAccountClient:
                     raise VivinoAuthError(
                         message or f"Vivino login failed (HTTP {resp.status})"
                     )
-        except VivinoAuthError:
+        except (VivinoAuthError, VivinoConnectionError):
             raise
         except Exception as err:
-            raise VivinoAuthError(f"Vivino login request failed: {err}") from err
+            raise VivinoConnectionError(
+                f"Vivino login request failed: {err}"
+            ) from err
 
         user = data.get("user") if isinstance(data.get("user"), dict) else data
         self._token = self._extract_token(data)

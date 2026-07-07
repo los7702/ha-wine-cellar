@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import voluptuous as vol
@@ -16,6 +17,8 @@ from .const import (
     CONF_VIVINO_PASSWORD,
     DOMAIN,
 )
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class WineCellarConfigFlow(ConfigFlow, domain=DOMAIN):
@@ -55,43 +58,80 @@ class WineCellarOptionsFlow(OptionsFlow):
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
         """Manage options."""
+        errors: dict[str, str] = {}
+
         if user_input is not None:
-            return self.async_create_entry(title="", data=user_input)
+            errors = await self._async_validate_vivino(user_input)
+            if not errors:
+                return self.async_create_entry(title="", data=user_input)
+
+        # On validation errors re-show the form with the entered values so
+        # the user can correct them without retyping everything.
+        current = user_input if user_input is not None else self.config_entry.options
 
         return self.async_show_form(
             step_id="init",
+            errors=errors,
             data_schema=vol.Schema(
                 {
                     vol.Optional(
                         "default_wine_type",
-                        default=self.config_entry.options.get(
-                            "default_wine_type", "red"
-                        ),
+                        default=current.get("default_wine_type", "red"),
                     ): vol.In(["red", "white", "rosé", "sparkling", "dessert"]),
                     vol.Optional(
                         "gemini_api_key",
-                        default=self.config_entry.options.get(
-                            "gemini_api_key", ""
-                        ),
+                        default=current.get("gemini_api_key", ""),
                     ): str,
                     vol.Optional(
                         CONF_VIVINO_EMAIL,
-                        default=self.config_entry.options.get(
-                            CONF_VIVINO_EMAIL, ""
-                        ),
+                        default=current.get(CONF_VIVINO_EMAIL, ""),
                     ): str,
                     vol.Optional(
                         CONF_VIVINO_PASSWORD,
-                        default=self.config_entry.options.get(
-                            CONF_VIVINO_PASSWORD, ""
-                        ),
+                        default=current.get(CONF_VIVINO_PASSWORD, ""),
                     ): str,
                     vol.Optional(
                         CONF_VIVINO_AUTO_SYNC,
-                        default=self.config_entry.options.get(
-                            CONF_VIVINO_AUTO_SYNC, False
-                        ),
+                        default=current.get(CONF_VIVINO_AUTO_SYNC, False),
                     ): bool,
                 }
             ),
         )
+
+    async def _async_validate_vivino(
+        self, user_input: dict[str, Any]
+    ) -> dict[str, str]:
+        """Test the Vivino credentials by logging in. Returns form errors."""
+        email = (user_input.get(CONF_VIVINO_EMAIL) or "").strip()
+        password = user_input.get(CONF_VIVINO_PASSWORD) or ""
+
+        if not email and not password:
+            return {}  # Vivino connection intentionally not configured
+        if not email or not password:
+            return {"base": "vivino_incomplete"}
+
+        # Only re-verify when the credentials actually changed
+        options = self.config_entry.options
+        if (
+            email == options.get(CONF_VIVINO_EMAIL)
+            and password == options.get(CONF_VIVINO_PASSWORD)
+        ):
+            return {}
+
+        from .vivino_account import (
+            VivinoAccountClient,
+            VivinoAuthError,
+            VivinoConnectionError,
+        )
+
+        client = VivinoAccountClient(self.hass, email, password)
+        try:
+            await client.async_verify()
+        except VivinoConnectionError as err:
+            _LOGGER.warning("Vivino connection test failed: %s", err)
+            return {"base": "vivino_cannot_connect"}
+        except VivinoAuthError as err:
+            _LOGGER.warning("Vivino credential check failed: %s", err)
+            return {"base": "vivino_invalid_auth"}
+        _LOGGER.debug("Vivino credentials verified for %s", email)
+        return {}
