@@ -11,7 +11,12 @@ import voluptuous as vol
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
-from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.core import (
+    HomeAssistant,
+    ServiceCall,
+    ServiceResponse,
+    SupportsResponse,
+)
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.event import async_track_time_interval
@@ -148,7 +153,8 @@ def _setup_vivino_account(hass: HomeAssistant, entry: ConfigEntry) -> None:
             if not client or not storage:
                 return
             try:
-                await async_sync_from_vivino(hass, storage, client)
+                # Same scope as the "all" target
+                await async_sync_from_vivino(hass, storage, client, sync_my_wines=True)
             except Exception as err:
                 _LOGGER.warning("Scheduled Vivino sync failed: %s", err)
 
@@ -339,7 +345,7 @@ async def _async_register_services(
         }),
     )
 
-    async def handle_sync_vivino(call: ServiceCall) -> None:
+    async def handle_sync_vivino(call: ServiceCall) -> ServiceResponse:
         """Handle Vivino account sync service call."""
         client = hass.data[DOMAIN].get("vivino_account")
         if not client:
@@ -356,8 +362,26 @@ async def _async_register_services(
             client,
             sync_cellar=target in ("all", "cellar"),
             sync_wishlist=target in ("all", "wishlist"),
+            sync_my_wines=target in ("all", "my_wines"),
         )
         hass.bus.async_fire(f"{DOMAIN}_vivino_sync_result", result)
+
+        # If every section failed and nothing came back, surface the failure
+        # in the service call itself instead of burying it in attributes.
+        nothing_synced = not (
+            result["cellar_total"] or result["wishlist_total"]
+            or result["my_wines_total"]
+            or result["cellar_imported"] or result["wishlist_imported"]
+            or result["my_wines_imported"]
+        )
+        if result["errors"] and nothing_synced:
+            raise HomeAssistantError(
+                "Vivino sync failed: " + "; ".join(result["errors"])
+            )
+
+        if call.return_response:
+            return result
+        return None
 
     hass.services.async_register(
         DOMAIN,
@@ -372,7 +396,8 @@ async def _async_register_services(
         handle_sync_vivino,
         schema=vol.Schema({
             vol.Optional("target", default="all"): vol.In(
-                ["all", "cellar", "wishlist"]
+                ["all", "cellar", "wishlist", "my_wines"]
             ),
         }),
+        supports_response=SupportsResponse.OPTIONAL,
     )

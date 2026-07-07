@@ -1228,7 +1228,7 @@ async def ws_import_wines(
     {
         vol.Required("type"): "wine_cellar/sync_vivino",
         vol.Optional("target", default="all"): vol.In(
-            ["all", "cellar", "wishlist"]
+            ["all", "cellar", "wishlist", "my_wines"]
         ),
     }
 )
@@ -1261,6 +1261,7 @@ async def ws_sync_vivino(
             client,
             sync_cellar=target in ("all", "cellar"),
             sync_wishlist=target in ("all", "wishlist"),
+            sync_my_wines=target in ("all", "my_wines"),
         )
     except VivinoAuthError as err:
         connection.send_result(msg["id"], {"error": f"Vivino login failed: {err}"})
