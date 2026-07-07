@@ -33,18 +33,38 @@ TOKEN_KEYS = (
 )
 
 
-def parse_creds(raw: str) -> tuple[str, str]:
+def parse_creds(raw: str):
+    """Return ('creds', email, password) or ('token', token, None)."""
     raw = raw.strip()
     if raw.startswith("{"):
         d = json.loads(raw)
-        return d["email"], d["password"]
-    if "\n" in raw:
-        a, b = raw.split("\n", 1)
-        return a.strip(), b.strip()
-    if ":" in raw:
+        tokv = d.get("token") or d.get("api_token") or d.get("access_token")
+        if tokv and not d.get("password"):
+            return "token", tokv, None
+        return "creds", d["email"], d["password"]
+    # Try common email/password separators
+    for sep in ("\n", "\t", "|", ";", ",", " "):
+        if sep in raw:
+            a, b = raw.split(sep, 1)
+            a, b = a.strip(), b.strip()
+            if a and b and "@" in a:
+                return "creds", a, b
+    if ":" in raw and "@" in raw.split(":", 1)[0]:
         a, b = raw.split(":", 1)
-        return a.strip(), b.strip()
-    raise ValueError("Unrecognized VIVINO secret format")
+        return "creds", a.strip(), b.strip()
+    # Single value with no pair → treat as a bearer token
+    return "token", raw, None
+
+
+def shape(raw: str) -> str:
+    """Non-revealing structural description of the secret."""
+    r = raw.strip()
+    return (
+        f"len={len(r)} has_at={'@' in r} has_space={' ' in r} "
+        f"has_colon={':' in r} has_newline={chr(10) in r} "
+        f"dot_segments={len(r.split('.'))} "
+        f"alnum_only={r.replace('.', '').replace('_', '').replace('-', '').isalnum()}"
+    )
 
 
 def tok(t) -> str:
@@ -97,11 +117,43 @@ async def main() -> int:
     if not raw:
         print("VIVINO secret not present in env")
         return 1
-    email, password = parse_creds(raw)
-    print(f"Parsed credentials: email_len={len(email)} pw_len={len(password)}")
+    print(f"Secret shape: {shape(raw)}")
+    kind, a, b = parse_creds(raw)
+    print(f"Interpreted as: {kind}")
 
     jar = aiohttp.CookieJar()
     async with aiohttp.ClientSession(cookie_jar=jar) as s:
+        # ── Token-only mode: test the provided bearer token directly ──
+        if kind == "token":
+            token = a
+            print(f"\n[T] Testing provided token ({tok(token)}) against api.vivino.com")
+            st, body = await probe(s, "GET", f"{API}/users/me", headers={**H, "Authorization": f"Bearer {token}"})
+            print(f"    GET api/users/me -> {st}; shape={structure(body) if isinstance(body,(dict,list)) else body}")
+            uid = None
+            if isinstance(body, dict):
+                u = body.get("user") if isinstance(body.get("user"), dict) else body
+                uid = u.get("id")
+                print(f"    resolved user id: {uid}  alias: {u.get('alias')!r}")
+            if not uid:
+                # Some deployments key /me differently; try the user object at root
+                print("    could not resolve user id from /users/me")
+            for path in ([f"users/{uid}/cellar", "cellars", f"users/{uid}/vintages", f"users/{uid}/wishlist"] if uid else ["cellars"]):
+                st6, b6 = await probe(s, "GET", f"{API}/{path}", headers={**H, "Authorization": f"Bearer {token}"}, params={"page": 1, "limit": 5})
+                shp = structure(b6) if isinstance(b6, (dict, list)) else b6
+                print(f"    GET api/{path} -> {st6}; shape={shp}")
+                if isinstance(b6, dict) and st6 == 200:
+                    for lk in ("cellar", "wishlist", "user_vintages", "vintages", "records", "items"):
+                        if isinstance(b6.get(lk), list) and b6[lk]:
+                            print(f"      first {lk} record: {structure(b6[lk][0])}")
+                            rec = b6[lk][0]
+                            for sub in ("vintage", "wine", "review", "price"):
+                                if isinstance(rec.get(sub), dict):
+                                    print(f"        .{sub}: {structure(rec[sub])}")
+                            break
+            print("\nDONE (token mode)")
+            return 0 if st == 200 else 1
+
+        email, password = a, b
         # ── 1. Website login ─────────────────────────────────────────
         st, body = await probe(
             s, "POST", f"{WWW}/api/login",
