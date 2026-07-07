@@ -132,16 +132,18 @@ To enable label recognition, AI analysis, wine list scanning, and batch AI scann
    - **Scan List** button to photograph wine lists and receipts for instant analysis
    - **Gemini price fallback** when Vivino has no pricing data
 
-### Vivino Account Sync (Optional)
+### Importing Your Vivino Wines
 
-To connect your Vivino wine cellar and wishlist:
+Vivino has no usable public API for reading your own cellar — the website login
+and the `api.vivino.com` mobile backend are separate auth systems, so a
+server-side integration cannot obtain a token the API accepts. To bring your
+Vivino wines in, export them from your logged-in browser and import the CSV:
 
-1. Go to **Settings > Devices & Services > Cork Dork > Configure**
-2. Enter your Vivino account email and password (optionally enable auto-sync). The credentials are verified against Vivino when you save — the form shows an error if the sign-in fails.
-3. A **🔄 Vivino Sync** button appears in the card header — tap it to import your Vivino cellar (as unassigned wines) and wishlist (into the buy list)
-4. Or call the `wine_cellar.sync_vivino` service from automations
-
-> **Note:** Vivino has no official public API. The sync uses the same endpoints as the Vivino web app and may break if Vivino changes them. Credentials are stored in your Home Assistant config entry and only ever sent to vivino.com.
+- See **[docs/vivino-import.md](docs/vivino-import.md)** for a copy-paste
+  browser-console exporter and step-by-step instructions.
+- Then use **📦 Inventory → Import CSV** to load the file, and optionally
+  **🍇 Vivino Batch Scan** to enrich the imported wines with ratings, pricing,
+  descriptions, and images from Vivino's public data.
 
 ## Default Cabinet Layout
 
