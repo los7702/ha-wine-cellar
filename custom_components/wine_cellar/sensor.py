@@ -152,6 +152,7 @@ class WineCellarVivinoSyncSensor(SensorEntity):
             "cellar_imported": status.get("cellar_imported"),
             "my_wines_total": status.get("my_wines_total"),
             "my_wines_imported": status.get("my_wines_imported"),
+            "my_wines_skipped_no_bottles": status.get("my_wines_skipped_no_bottles"),
             "wishlist_total": status.get("wishlist_total"),
             "wishlist_imported": status.get("wishlist_imported"),
             "errors": status.get("errors", []),

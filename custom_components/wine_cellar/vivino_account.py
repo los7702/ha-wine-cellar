@@ -417,9 +417,15 @@ def _parse_user_wine(record: dict[str, Any]) -> dict[str, Any] | None:
         if isinstance(alc, (int, float)) and alc > 0:
             alcohol = f"{alc}%"
 
-        bottle_count = record.get("bottle_count") or record.get("count") or 1
-        if not isinstance(bottle_count, int) or bottle_count < 1:
-            bottle_count = 1
+        # How many bottles the user actually owns. None when Vivino sent no
+        # count at all — importers treat that the same as owning zero.
+        owned_count = None
+        for key in ("cellar_count", "bottle_count", "count"):
+            val = record.get(key)
+            if isinstance(val, int) and val >= 0:
+                owned_count = val
+                break
+        bottle_count = owned_count if owned_count and owned_count > 0 else 1
 
         # The user's own rating/note (present on "My Wines" records)
         user_rating = None
@@ -460,6 +466,7 @@ def _parse_user_wine(record: dict[str, Any]) -> dict[str, Any] | None:
             "notes": user_note,
             "vivino_id": str(vivino_id) if vivino_id is not None else "",
             "bottle_count": bottle_count,
+            "owned_count": owned_count,
             "source": "vivino_account",
         }
     except Exception as err:
@@ -497,10 +504,12 @@ async def async_sync_from_vivino(
     result: dict[str, Any] = {
         "cellar_total": 0,
         "cellar_imported": 0,
+        "cellar_skipped_no_bottles": 0,
         "wishlist_total": 0,
         "wishlist_imported": 0,
         "my_wines_total": 0,
         "my_wines_imported": 0,
+        "my_wines_skipped_no_bottles": 0,
         "errors": [],
     }
 
@@ -515,16 +524,29 @@ async def async_sync_from_vivino(
         key = _wine_key(wine)
         existing_keys[key] = existing_keys.get(key, 0) + 1
 
-    def _import_wines(entries: list[dict[str, Any]], source: str) -> int:
-        """Add missing bottles to the local cellar; returns import count."""
+    def _import_wines(entries: list[dict[str, Any]], source: str) -> tuple[int, int]:
+        """Add missing owned bottles to the local cellar.
+
+        Entries whose Vivino bottle count is zero or missing are skipped —
+        rated/drunk wines without bottles must not become inventory.
+        Returns (imported, skipped) counts.
+        """
         imported = 0
+        skipped = 0
         for entry in entries:
+            owned = entry.get("owned_count")
+            if not owned or owned <= 0:
+                skipped += 1
+                continue
             wanted = entry.get("bottle_count", 1)
             vid = entry.get("vivino_id", "")
             key = _wine_key(entry)
             have = existing_ids.get(vid, 0) if vid else existing_keys.get(key, 0)
             for _ in range(max(0, wanted - have)):
-                wine_data = {k: v for k, v in entry.items() if k != "bottle_count"}
+                wine_data = {
+                    k: v for k, v in entry.items()
+                    if k not in ("bottle_count", "owned_count")
+                }
                 wine_data["cabinet_id"] = ""  # lands in the Unassigned tab
                 wine_data["source"] = source
                 storage.add_wine(wine_data)
@@ -534,13 +556,21 @@ async def async_sync_from_vivino(
             if vid:
                 existing_ids[vid] = max(have, wanted)
             existing_keys[key] = max(existing_keys.get(key, 0), wanted)
-        return imported
+        if skipped:
+            _LOGGER.debug(
+                "Vivino %s: skipped %d wines with no bottles", source, skipped
+            )
+        return imported, skipped
 
     if sync_cellar:
         try:
             cellar = await client.async_get_cellar()
-            result["cellar_total"] = sum(w.get("bottle_count", 1) for w in cellar)
-            result["cellar_imported"] = _import_wines(cellar, "vivino_cellar")
+            # Total = bottles the user owns per Vivino, not raw record count
+            result["cellar_total"] = sum(w.get("owned_count") or 0 for w in cellar)
+            (
+                result["cellar_imported"],
+                result["cellar_skipped_no_bottles"],
+            ) = _import_wines(cellar, "vivino_cellar")
         except VivinoAuthError as err:
             result["errors"].append(
                 f"Cellar: {err} — the Vivino Wine Cellar is a Vivino Premium "
@@ -554,8 +584,15 @@ async def async_sync_from_vivino(
     if sync_my_wines:
         try:
             my_wines = await client.async_get_my_wines()
-            result["my_wines_total"] = len(my_wines)
-            result["my_wines_imported"] = _import_wines(my_wines, "vivino_my_wines")
+            # Total = bottles the user owns per Vivino; rated wines without
+            # bottles are counted separately as skipped
+            result["my_wines_total"] = sum(
+                w.get("owned_count") or 0 for w in my_wines
+            )
+            (
+                result["my_wines_imported"],
+                result["my_wines_skipped_no_bottles"],
+            ) = _import_wines(my_wines, "vivino_my_wines")
         except VivinoAuthError as err:
             result["errors"].append(f"My Wines: {err}")
         except Exception as err:

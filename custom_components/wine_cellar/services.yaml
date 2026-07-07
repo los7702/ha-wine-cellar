@@ -121,8 +121,10 @@ sync_vivino:
       name: Target
       description: >-
         What to sync from your Vivino account. "cellar" is the Vivino Premium
-        Wine Cellar; "my_wines" is every wine you have rated or scanned;
-        "wishlist" goes to the buy list. "all" syncs everything available.
+        Wine Cellar; "my_wines" imports your rated/scanned wines that have a
+        bottle count greater than zero (rated wines without bottles are
+        skipped); "wishlist" goes to the buy list. "all" syncs everything
+        available.
       default: all
       selector:
         select:
