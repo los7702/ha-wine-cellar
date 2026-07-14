@@ -24,7 +24,7 @@ import logging
 import re
 from datetime import datetime, timezone
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import aiohttp
 
@@ -94,6 +94,41 @@ def _parse_data_page(html: str) -> dict[str, Any] | None:
         return data if isinstance(data, dict) else None
     except (ValueError, TypeError):
         return None
+
+
+def _count_in_props(props: Any, vintage_id: int | str) -> int | None:
+    """Owned-bottle count for a vintage within already-fetched props, or None."""
+    target = str(vintage_id)
+    for rec in _find_wine_array(props):
+        w = _parse_user_wine(rec)
+        if w and w.get("vivino_id") == target:
+            return w.get("owned_count") or 0
+    return None
+
+
+def _split_cookie(cookie_header: str) -> dict[str, str]:
+    """Parse a ``name=value; name2=value2`` cookie header into a dict."""
+    out: dict[str, str] = {}
+    for part in (cookie_header or "").split(";"):
+        part = part.strip()
+        if "=" in part:
+            k, v = part.split("=", 1)
+            out[k.strip()] = v.strip()
+    return out
+
+
+def _parse_set_cookies(headers: Any) -> dict[str, str]:
+    """Extract name=value pairs from a response's Set-Cookie headers."""
+    out: dict[str, str] = {}
+    try:
+        for c in headers.getall("Set-Cookie", []):
+            nv = c.split(";", 1)[0]
+            if "=" in nv:
+                k, v = nv.split("=", 1)
+                out[k.strip()] = v.strip()
+    except Exception:
+        pass
+    return out
 
 
 def _looks_like_wine(obj: Any) -> bool:
@@ -308,6 +343,153 @@ class VivinoAccountClient:
         wines = [w for w in (_parse_user_wine(r) for r in records) if w]
         _log_parse_outcome("cellar", records, wines)
         return wines
+
+    # ── Write-back (Cork Dork -> Vivino) ─────────────────────────────
+
+    def _cellar_numeric_id(self) -> str:
+        """Return the numeric cellar id from the configured path."""
+        m = re.search(r"/cellars/(\d+)", self._path or "")
+        if not m:
+            raise VivinoAuthError("Could not determine the Vivino cellar id")
+        return m.group(1)
+
+    async def _load_write_context(self) -> tuple[str, str, str, str, dict[str, Any]]:
+        """GET the cellar page to obtain everything a write needs.
+
+        Writes require more than reads: a fresh CSRF token pair. The GET
+        Set-Cookies ``csrf_token`` / ``XSRF-TOKEN`` and embeds a ``csrf-token``
+        meta; we replay all of those on the POST. Returns
+        ``(version, cookie_header, csrf_meta, xsrf_value, props)``.
+        """
+        session = self._get_session()
+        try:
+            async with session.get(
+                f"{WWW_BASE}{self._path}",
+                headers={**HEADERS, "Cookie": self._cookie, "Accept": "text/html"},
+                timeout=REQUEST_TIMEOUT, allow_redirects=False,
+            ) as resp:
+                if resp.status in (301, 302, 303, 307, 308):
+                    raise VivinoAuthError(
+                        "Vivino redirected to login — session cookie expired"
+                    )
+                if resp.status != 200:
+                    raise RuntimeError(f"Cellar page returned HTTP {resp.status}")
+                html = await resp.text()
+                fresh = _parse_set_cookies(resp.headers)
+        except (VivinoAuthError, VivinoConnectionError, RuntimeError):
+            raise
+        except Exception as err:
+            raise VivinoConnectionError(f"Could not reach Vivino: {err}") from err
+
+        m = re.search(r'<meta name="csrf-token" content="([^"]+)"', html)
+        page = _parse_data_page(html)
+        if not m or not page:
+            raise VivinoAuthError(
+                "No CSRF token / cellar data on the page — session cookie is "
+                "likely invalid; paste a fresh one"
+            )
+        cookies = _split_cookie(self._cookie)
+        cookies.update(fresh)  # fresh session + csrf_token + XSRF-TOKEN win
+        cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items())
+        return (
+            page.get("version") or "",
+            cookie_header,
+            m.group(1),
+            cookies.get("XSRF-TOKEN", ""),
+            page.get("props") or {},
+        )
+
+    async def _count_for_vintage(self, vintage_id: int | str) -> int:
+        """Read the current owned-bottle count for a vintage (0 if absent).
+
+        A just-modified wine sorts to the top, so page 1 almost always has it;
+        we still page through as a fallback.
+        """
+        target = str(vintage_id)
+        for page in range(1, MAX_PAGES + 1):
+            props = await self._get_props(page)
+            batch = _find_wine_array(props)
+            if not batch:
+                break
+            for rec in batch:
+                w = _parse_user_wine(rec)
+                if w and w.get("vivino_id") == target:
+                    return w.get("owned_count") or 0
+        return 0
+
+    async def async_change_bottles(
+        self, vintage_id: int | str, delta: int, comment: str = "Cork Dork sync"
+    ) -> dict[str, Any]:
+        """Add (delta>0) or consume (delta<0) bottles of a vintage in the cellar.
+
+        Success is judged by re-reading the cellar, NOT by the HTTP status:
+        Vivino's ``add`` returns HTTP 500 while still succeeding, so a 500 is
+        never treated as failure and never retried (that would double-add).
+        Returns a result dict with before/after counts and an ``ok`` flag.
+        """
+        vintage_id = int(vintage_id)
+        if delta == 0:
+            return {"vintage_id": vintage_id, "delta": 0, "ok": True, "skipped": True}
+
+        version, cookie_header, csrf, xsrf, props = await self._load_write_context()
+        before = _count_in_props(props, vintage_id)
+        if before is None:
+            before = await self._count_for_vintage(vintage_id)
+
+        typ = "add" if delta > 0 else "consume"
+        cid = self._cellar_numeric_id()
+        headers = {
+            **HEADERS,
+            "Cookie": cookie_header,
+            "Accept": "text/html, application/xhtml+xml",
+            "Content-Type": "application/json",
+            "X-Inertia": "true",
+            "X-Inertia-Version": version,
+            "X-Requested-With": "XMLHttpRequest",
+            "X-CSRF-Token": csrf,
+            "X-XSRF-TOKEN": unquote(xsrf) if xsrf else "",
+            "Origin": WWW_BASE,
+            "Referer": f"{WWW_BASE}{self._path}",
+        }
+        body = json.dumps({
+            "vintage_id": vintage_id,
+            "type": typ,
+            "count": abs(delta),
+            "comment": comment,
+        })
+
+        session = self._get_session()
+        status: int | None = None
+        try:
+            async with session.post(
+                f"{WWW_BASE}/cellars/{cid}/events",
+                headers=headers, data=body,
+                timeout=REQUEST_TIMEOUT, allow_redirects=False,
+            ) as resp:
+                status = resp.status
+                await resp.read()
+        except Exception as err:
+            # Network failure: we cannot know if it applied — verify below.
+            _LOGGER.debug("Vivino event POST raised (will verify): %s", err)
+
+        # Verify by re-reading — the only reliable signal.
+        after = await self._count_for_vintage(vintage_id)
+        expected = max(0, before + delta)
+        ok = after == expected
+        _LOGGER.debug(
+            "Vivino %s vintage %s x%d: http=%s before=%s after=%s expected=%s ok=%s",
+            typ, vintage_id, abs(delta), status, before, after, expected, ok,
+        )
+        return {
+            "vintage_id": vintage_id,
+            "delta": delta,
+            "type": typ,
+            "http_status": status,
+            "before": before,
+            "after": after,
+            "expected": expected,
+            "ok": ok,
+        }
 
     async def async_get_wishlist(self) -> list[dict[str, Any]]:
         """Wishlist import is not supported via the Inertia cellar endpoint."""
