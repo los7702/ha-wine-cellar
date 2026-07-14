@@ -31,13 +31,13 @@ developer tools (the `document.cookie` console trick won't show it):
 1. With vivino.com open and logged in, press `F12` → **Application** tab
    (Chrome/Edge) or **Storage** tab (Firefox).
 2. In the left sidebar: **Cookies → https://www.vivino.com**.
-3. Find the row named **`_vivino_session`** and copy its **Value** (a long
+3. Find the row named **`_ruby-web_session`** and copy its **Value** (a long
    string). That value is your session cookie.
 
 *Optional, more robust:* to also capture a longer-lived "remember me" cookie,
 use the **Network** tab instead — click any request to `www.vivino.com`, find
 **Request Headers → Cookie**, and copy the entire value. Paste that whole string
-(it contains `_vivino_session=…; remember_user_token=…; …`).
+(it contains `_ruby-web_session=…; vv_sid=…; …`).
 
 ### 3. Configure Cork Dork
 
@@ -136,7 +136,7 @@ Then in Cork Dork: **📦 Inventory → Import CSV** and choose the file.
 ## Troubleshooting
 
 - **"Vivino returned a web page instead of cellar data"** — the cookie is wrong
-  or expired. Re-copy `_vivino_session` (step 2).
+  or expired. Re-copy `_ruby-web_session` (step 2).
 - **Sync reports "no recognizable wine list"** with a list of `props keys` in the
   Home Assistant log — Vivino changed the cellar data shape. Share that log line
   (or the console output from Method B) so the parser can be pointed at the new

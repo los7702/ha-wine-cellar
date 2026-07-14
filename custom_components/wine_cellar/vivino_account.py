@@ -62,13 +62,14 @@ def _normalize_cookie(raw: str) -> str:
     """Normalize a pasted cookie into a Cookie header value.
 
     Accepts a full ``name=value; name2=value2`` header (best — copied from the
-    browser's Network tab), a single ``_vivino_session=...`` pair, or a bare
-    session value (wrapped as ``_vivino_session=<value>``).
+    browser's Network tab), a single ``name=value`` pair, or a bare session
+    value (wrapped as ``_ruby-web_session=<value>`` — Vivino's Rails session
+    cookie name).
     """
     raw = (raw or "").strip().strip(";").strip()
     if "=" in raw:
         return raw
-    return f"_vivino_session={raw}"
+    return f"_ruby-web_session={raw}"
 
 
 def _cellar_path(cellar_url: str) -> str:
