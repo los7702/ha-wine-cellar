@@ -127,12 +127,15 @@ class WineCellarOptionsFlow(OptionsFlow):
         client = VivinoAccountClient(self.hass, cookie, cellar_url)
         try:
             result = await client.async_verify()
-        except VivinoConnectionError as err:
-            _LOGGER.warning("Vivino connection test failed: %s", err)
-            return {"base": "vivino_cannot_connect"}
         except VivinoAuthError as err:
             _LOGGER.warning("Vivino cookie check failed: %s", err)
             return {"base": "vivino_invalid_auth"}
+        except VivinoConnectionError as err:
+            _LOGGER.warning("Vivino connection test failed: %s", err)
+            return {"base": "vivino_cannot_connect"}
+        except Exception:  # noqa: BLE001 - surface as a form error, not a crash
+            _LOGGER.exception("Unexpected error verifying Vivino cookie")
+            return {"base": "vivino_cannot_connect"}
         _LOGGER.debug("Vivino cookie verified; first page wines: %s",
                       result.get("first_page_wines"))
         return {}

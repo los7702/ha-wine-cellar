@@ -36,7 +36,6 @@ from .const import DOMAIN
 _LOGGER = logging.getLogger(__name__)
 
 WWW_BASE = "https://www.vivino.com"
-HOME_URL = WWW_BASE + "/"
 
 REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=30)
 MAX_PAGES = 60  # safety cap
@@ -81,6 +80,20 @@ def _cellar_path(cellar_url: str) -> str:
         parsed = urlparse(raw)
         return parsed.path or "/"
     return raw if raw.startswith("/") else "/" + raw
+
+
+def _parse_data_page(html: str) -> dict[str, Any] | None:
+    """Extract and decode the Inertia ``#app data-page`` JSON from cellar HTML."""
+    m = re.search(r'data-page="([^"]+)"', html)
+    if not m:
+        return None
+    raw = (m.group(1).replace("&quot;", '"').replace("&amp;", "&")
+           .replace("&#39;", "'").replace("&#34;", '"'))
+    try:
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else None
+    except (ValueError, TypeError):
+        return None
 
 
 def _looks_like_wine(obj: Any) -> bool:
@@ -136,9 +149,17 @@ class VivinoAccountClient:
         self._session_rejected = False
 
     def _get_session(self) -> aiohttp.ClientSession:
-        """Return the dedicated aiohttp session, creating it if needed."""
+        """Return the dedicated aiohttp session, creating it if needed.
+
+        Uses a DummyCookieJar so aiohttp never stores or auto-sends cookies —
+        the pasted session cookie is supplied verbatim via the Cookie header,
+        avoiding duplicate/rewritten Cookie headers (which corrupt the
+        percent-encoded session value).
+        """
         if self._session is None or self._session.closed:
-            self._session = async_create_clientsession(self._hass)
+            self._session = async_create_clientsession(
+                self._hass, cookie_jar=aiohttp.DummyCookieJar()
+            )
         return self._session
 
     def _headers(self, inertia: bool = False) -> dict[str, str]:
@@ -150,103 +171,104 @@ class VivinoAccountClient:
                 h["X-Inertia-Version"] = self._version
         return h
 
-    async def _refresh_version(self) -> str | None:
-        """Read the current Inertia asset version from the homepage."""
-        session = self._get_session()
-        try:
-            async with session.get(
-                HOME_URL, headers={**HEADERS, "Cookie": self._cookie,
-                                   "Accept": "text/html"},
-                timeout=REQUEST_TIMEOUT, allow_redirects=True,
-            ) as resp:
-                html = await resp.text()
-        except Exception as err:
-            raise VivinoConnectionError(f"Could not reach Vivino: {err}") from err
-        m = re.search(r'data-page="([^"]+)"', html)
-        if m:
-            raw = (m.group(1).replace("&quot;", '"').replace("&amp;", "&")
-                   .replace("&#39;", "'"))
-            try:
-                self._version = json.loads(raw).get("version")
-            except Exception:
-                vm = re.search(r'\\?"version\\?":\\?"([^"\\]+)', raw)
-                self._version = vm.group(1) if vm else None
-        return self._version
+    async def _get_props(self, page: int) -> dict[str, Any]:
+        """Fetch one page of cellar Inertia props.
 
-    async def _inertia_get(self, page: int) -> dict[str, Any]:
-        """Fetch one page of the Inertia cellar props.
-
-        Raises VivinoAuthError if the session cookie is missing/expired (the
-        endpoint then serves an HTML login page instead of Inertia JSON).
+        Page 1 is read from the cellar page's rendered HTML — its embedded
+        ``#app data-page`` payload carries both the Inertia asset version and
+        the first page of wines. Later pages use the Inertia XHR protocol with
+        that version. A redirect to the login page (or an HTML body where JSON
+        was expected) means the session cookie is missing or expired.
         """
         if not self._path:
             raise VivinoAuthError("No Vivino cellar URL configured")
         session = self._get_session()
-        url = f"{WWW_BASE}{self._path}?page={page}"
 
+        if page == 1:
+            try:
+                async with session.get(
+                    f"{WWW_BASE}{self._path}",
+                    headers={**HEADERS, "Cookie": self._cookie,
+                             "Accept": "text/html"},
+                    timeout=REQUEST_TIMEOUT, allow_redirects=False,
+                ) as resp:
+                    _LOGGER.debug("Vivino cellar page -> HTTP %s", resp.status)
+                    if resp.status in (301, 302, 303, 307, 308):
+                        raise VivinoAuthError(
+                            "Vivino redirected to login — the session cookie is "
+                            "missing or expired; paste a fresh one"
+                        )
+                    if resp.status != 200:
+                        raise RuntimeError(
+                            f"Vivino cellar page returned HTTP {resp.status}"
+                        )
+                    html = await resp.text()
+            except (VivinoAuthError, VivinoConnectionError, RuntimeError):
+                raise
+            except Exception as err:
+                raise VivinoConnectionError(
+                    f"Could not reach Vivino: {err}"
+                ) from err
+
+            page_obj = _parse_data_page(html)
+            if not page_obj:
+                raise VivinoAuthError(
+                    "No cellar data found on the page — the session cookie is "
+                    "likely invalid or expired; paste a fresh one"
+                )
+            self._version = page_obj.get("version")
+            props = page_obj.get("props")
+            return props if isinstance(props, dict) else {}
+
+        # Pages 2+ via the Inertia XHR protocol
+        url = f"{WWW_BASE}{self._path}?page={page}"
         for attempt in (1, 2):
             try:
                 async with session.get(
                     url, headers=self._headers(inertia=True),
                     timeout=REQUEST_TIMEOUT, allow_redirects=False,
                 ) as resp:
-                    # Inertia version drift → refresh and retry once
                     if resp.status == 409 and attempt == 1:
-                        self._version = resp.headers.get("X-Inertia-Version")
-                        if not self._version:
-                            await self._refresh_version()
+                        # Asset version drifted → re-read it from the page
+                        await self._get_props(1)
                         continue
-                    # A redirect (to the login page) means the cookie is dead
                     if resp.status in (301, 302, 303, 307, 308):
                         raise VivinoAuthError(
-                            "Vivino redirected to login — the session cookie is "
-                            "missing or expired; paste a fresh one"
-                        )
-                    if resp.status == 401 or resp.status == 403:
-                        raise VivinoAuthError(
-                            "Vivino rejected the session cookie (HTTP "
-                            f"{resp.status}) — paste a fresh one"
+                            "Vivino session expired mid-sync; paste a fresh cookie"
                         )
                     if resp.status != 200:
                         raise RuntimeError(
-                            f"Vivino cellar page returned HTTP {resp.status}"
+                            f"Vivino cellar XHR returned HTTP {resp.status}"
                         )
                     text = await resp.text()
             except (VivinoAuthError, VivinoConnectionError, RuntimeError):
                 raise
             except Exception as err:
-                raise VivinoConnectionError(
-                    f"Vivino request failed: {err}"
-                ) from err
+                raise VivinoConnectionError(f"Vivino request failed: {err}") from err
 
             try:
                 data = json.loads(text)
             except ValueError:
-                # Got HTML instead of Inertia JSON → not authenticated
                 raise VivinoAuthError(
-                    "Vivino returned a web page instead of cellar data — the "
-                    "session cookie is missing or expired; paste a fresh one"
+                    "Vivino returned a web page instead of cellar data; paste a "
+                    "fresh session cookie"
                 )
             props = data.get("props") if isinstance(data, dict) else None
             return props if isinstance(props, dict) else {}
         return {}
 
     async def async_verify(self) -> dict[str, Any]:
-        """Validate the cookie + cellar URL by fetching the first page."""
-        await self._refresh_version()
-        props = await self._inertia_get(1)
+        """Validate the cookie + cellar URL by loading the cellar page."""
+        props = await self._get_props(1)
         wines = _find_wine_array(props)
         return {"reachable": True, "first_page_wines": len(wines)}
 
     async def async_get_cellar(self) -> list[dict[str, Any]]:
         """Return the user's Vivino cellar as parsed wine dicts."""
-        if self._version is None:
-            await self._refresh_version()
-
         records: list[dict[str, Any]] = []
         seen: set[str] = set()
         for page in range(1, MAX_PAGES + 1):
-            props = await self._inertia_get(page)
+            props = await self._get_props(page)
             batch = _find_wine_array(props)
             if not batch:
                 if page == 1 and props:
