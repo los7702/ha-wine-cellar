@@ -108,7 +108,20 @@ def _looks_like_wine(obj: Any) -> bool:
 
 
 def _find_wine_array(node: Any) -> list[dict[str, Any]]:
-    """Recursively locate the largest array of wine-like records in Inertia props."""
+    """Locate the array of wine-like records in Inertia cellar props.
+
+    Prefers the known Vivino cellar key (``props.entries``); otherwise falls
+    back to the largest wine-like array found anywhere in the tree.
+    """
+    if isinstance(node, dict):
+        for key in ("entries", "cellar_entries", "wines", "user_vintages"):
+            v = node.get(key)
+            if (
+                isinstance(v, list) and v
+                and sum(1 for x in v if _looks_like_wine(x)) >= max(1, len(v) // 2)
+            ):
+                return [x for x in v if isinstance(x, dict)]
+
     best: list[dict[str, Any]] = []
 
     def visit(n: Any) -> None:
@@ -396,31 +409,67 @@ def _parse_user_wine(record: dict[str, Any]) -> dict[str, Any] | None:
         if isinstance(alc, (int, float)) and alc > 0:
             alcohol = f"{alc}%"
 
-        # How many bottles the user actually owns. None when Vivino sent no
-        # count at all — importers treat that the same as owning zero.
+        # How many bottles the user owns. A Vivino cellar entry stores its
+        # physical bottles as record.extras.cellar_bottles (each with a
+        # deleted_at that is set once the bottle is consumed); the live count
+        # is the number of non-deleted bottles. Fall back to a user_vintage or
+        # top-level integer count for other response shapes.
         owned_count = None
-        for key in ("cellar_count", "bottle_count", "count"):
-            val = record.get(key)
-            if isinstance(val, int) and val >= 0:
-                owned_count = val
-                break
+        purchase_price = None
+        extras = record.get("extras")
+        if isinstance(extras, dict):
+            bottles = extras.get("cellar_bottles")
+            if isinstance(bottles, list):
+                live = [
+                    b for b in bottles
+                    if isinstance(b, dict) and not b.get("deleted_at")
+                ]
+                owned_count = len(live)
+                for b in live:
+                    pp = b.get("purchase_price")
+                    if isinstance(pp, (int, float)) and pp > 0:
+                        purchase_price = round(float(pp), 2)
+                        break
+        if owned_count is None:
+            uv = record.get("user_vintage")
+            if isinstance(uv, dict) and isinstance(uv.get("cellar_count"), int):
+                owned_count = uv["cellar_count"]
+        if owned_count is None:
+            for key in ("cellar_count", "bottle_count", "count"):
+                val = record.get(key)
+                if isinstance(val, int) and val >= 0:
+                    owned_count = val
+                    break
         bottle_count = owned_count if owned_count and owned_count > 0 else 1
 
-        # The user's own rating/note (present on cellar / "My Wines" records)
+        # The user's own rating/note. Vivino cellar entries carry these under
+        # user_vintage (rating + personal_note, or a nested review); other
+        # shapes use user_review/review/rating.
         user_rating = None
         user_note = ""
-        review = record.get("user_review") or record.get("review")
-        if isinstance(review, dict):
-            ur = review.get("rating")
-            if isinstance(ur, (int, float)) and 0 < ur <= 5:
+
+        def _apply_review(src: dict[str, Any]) -> None:
+            nonlocal user_rating, user_note
+            ur = src.get("rating")
+            if user_rating is None and isinstance(ur, (int, float)) and 0 < ur <= 5:
                 user_rating = round(float(ur) * 2) / 2  # half-star steps
-            note = review.get("note")
-            if isinstance(note, str):
-                user_note = note.strip()
-        if user_rating is None:
-            ur = record.get("rating")
-            if isinstance(ur, (int, float)) and 0 < ur <= 5:
-                user_rating = round(float(ur) * 2) / 2
+            for note_key in ("personal_note", "note"):
+                note = src.get(note_key)
+                if not user_note and isinstance(note, str) and note.strip():
+                    user_note = note.strip()
+
+        uv = record.get("user_vintage")
+        if isinstance(uv, dict):
+            _apply_review(uv)
+            if isinstance(uv.get("review"), dict):
+                _apply_review(uv["review"])
+        for alt in ("user_review", "review"):
+            if isinstance(record.get(alt), dict):
+                _apply_review(record[alt])
+        if user_rating is None and isinstance(record.get("rating"), (int, float)):
+            r = record["rating"]
+            if 0 < r <= 5:
+                user_rating = round(float(r) * 2) / 2
 
         # Stable Vivino identity for dedupe across syncs: prefer vintage id
         vivino_id = vintage.get("id") or wine.get("id") or record.get("id")
@@ -443,6 +492,7 @@ def _parse_user_wine(record: dict[str, Any]) -> dict[str, Any] | None:
             "alcohol": alcohol,
             "user_rating": user_rating,
             "notes": user_note,
+            "price": purchase_price,
             "vivino_id": str(vivino_id) if vivino_id is not None else "",
             "bottle_count": bottle_count,
             "owned_count": owned_count,
