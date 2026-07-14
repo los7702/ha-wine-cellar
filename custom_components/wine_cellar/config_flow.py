@@ -13,8 +13,8 @@ from homeassistant.data_entry_flow import FlowResult
 
 from .const import (
     CONF_VIVINO_AUTO_SYNC,
-    CONF_VIVINO_EMAIL,
-    CONF_VIVINO_PASSWORD,
+    CONF_VIVINO_CELLAR_URL,
+    CONF_VIVINO_SESSION_COOKIE,
     DOMAIN,
 )
 
@@ -83,12 +83,12 @@ class WineCellarOptionsFlow(OptionsFlow):
                         default=current.get("gemini_api_key", ""),
                     ): str,
                     vol.Optional(
-                        CONF_VIVINO_EMAIL,
-                        default=current.get(CONF_VIVINO_EMAIL, ""),
+                        CONF_VIVINO_CELLAR_URL,
+                        default=current.get(CONF_VIVINO_CELLAR_URL, ""),
                     ): str,
                     vol.Optional(
-                        CONF_VIVINO_PASSWORD,
-                        default=current.get(CONF_VIVINO_PASSWORD, ""),
+                        CONF_VIVINO_SESSION_COOKIE,
+                        default=current.get(CONF_VIVINO_SESSION_COOKIE, ""),
                     ): str,
                     vol.Optional(
                         CONF_VIVINO_AUTO_SYNC,
@@ -101,20 +101,20 @@ class WineCellarOptionsFlow(OptionsFlow):
     async def _async_validate_vivino(
         self, user_input: dict[str, Any]
     ) -> dict[str, str]:
-        """Test the Vivino credentials by logging in. Returns form errors."""
-        email = (user_input.get(CONF_VIVINO_EMAIL) or "").strip()
-        password = user_input.get(CONF_VIVINO_PASSWORD) or ""
+        """Test the Vivino session cookie against the cellar. Returns errors."""
+        cookie = (user_input.get(CONF_VIVINO_SESSION_COOKIE) or "").strip()
+        cellar_url = (user_input.get(CONF_VIVINO_CELLAR_URL) or "").strip()
 
-        if not email and not password:
+        if not cookie and not cellar_url:
             return {}  # Vivino connection intentionally not configured
-        if not email or not password:
+        if not cookie or not cellar_url:
             return {"base": "vivino_incomplete"}
 
-        # Only re-verify when the credentials actually changed
+        # Only re-verify when the cookie or URL actually changed
         options = self.config_entry.options
         if (
-            email == options.get(CONF_VIVINO_EMAIL)
-            and password == options.get(CONF_VIVINO_PASSWORD)
+            cookie == options.get(CONF_VIVINO_SESSION_COOKIE)
+            and cellar_url == options.get(CONF_VIVINO_CELLAR_URL)
         ):
             return {}
 
@@ -124,14 +124,15 @@ class WineCellarOptionsFlow(OptionsFlow):
             VivinoConnectionError,
         )
 
-        client = VivinoAccountClient(self.hass, email, password)
+        client = VivinoAccountClient(self.hass, cookie, cellar_url)
         try:
-            await client.async_verify()
+            result = await client.async_verify()
         except VivinoConnectionError as err:
             _LOGGER.warning("Vivino connection test failed: %s", err)
             return {"base": "vivino_cannot_connect"}
         except VivinoAuthError as err:
-            _LOGGER.warning("Vivino credential check failed: %s", err)
+            _LOGGER.warning("Vivino cookie check failed: %s", err)
             return {"base": "vivino_invalid_auth"}
-        _LOGGER.debug("Vivino credentials verified for %s", email)
+        _LOGGER.debug("Vivino cookie verified; first page wines: %s",
+                      result.get("first_page_wines"))
         return {}

@@ -61,8 +61,8 @@ CONF_WINE_HISTORY = "wine_history"
 
 CONF_GEMINI_API_KEY = "gemini_api_key"
 
-CONF_VIVINO_EMAIL = "vivino_email"
-CONF_VIVINO_PASSWORD = "vivino_password"
+CONF_VIVINO_SESSION_COOKIE = "vivino_session_cookie"
+CONF_VIVINO_CELLAR_URL = "vivino_cellar_url"
 CONF_VIVINO_AUTO_SYNC = "vivino_auto_sync"
 
 VIVINO_AUTO_SYNC_INTERVAL_HOURS = 12

@@ -66,11 +66,8 @@ A custom Home Assistant integration for managing your wine collection. Track bot
 - **Auto-Enrich on Add** — When you add a wine, Vivino data (rating, price, description, food pairings) is automatically fetched in the background
 
 ### Vivino Integration
-- **Vivino Account Connection** — Link your Vivino account (email + password in the integration options) to connect your Vivino wine cellar
-- **Cellar Sync** — One-tap 🔄 Vivino Sync imports every bottle from your Vivino cellar (with ratings, images, region, and grape data) as unassigned wines ready to be placed in your racks. Bottle counts are respected and already-imported bottles are never duplicated. Note: the Vivino Wine Cellar is a Vivino Premium feature.
-- **My Wines Sync** — No Premium? The sync also imports your Vivino "My Wines", including your personal star rating and review note. Only wines with a bottle count above zero are imported — rated wines you no longer own are skipped.
-- **Wishlist Sync** — Your Vivino wishlist is imported into the Cork Dork buy list (skipping wines already in your cellar)
-- **Auto Sync** — Optionally sync from Vivino automatically twice a day
+- **Cellar Sync** — Connect your Vivino cellar by pasting your cellar URL and session cookie once (see **[docs/vivino-import.md](docs/vivino-import.md)**). One-tap 🔄 Vivino Sync then imports every bottle you own (with ratings, images, region, grape data, and your personal star ratings/notes) as unassigned wines. Bottle counts are respected and already-imported bottles are never duplicated.
+- **Auto Sync** — Optionally sync the cellar automatically twice a day. When the session cookie expires, a notification prompts you to paste a fresh one.
 - **Sync Service & Sensor** — `wine_cellar.sync_vivino` service for automations plus a `Cork Dork Vivino Cellar` sensor reporting the last sync
 - **Vivino Batch Scan** — Refresh all wines from Vivino in one click: ratings, review counts, market pricing, descriptions, food pairings, alcohol content, and grape variety. Falls back to Gemini AI pricing when Vivino has no price.
 - **Individual Vivino Refresh** — Update any single wine's Vivino data from the detail dialog
@@ -132,17 +129,21 @@ To enable label recognition, AI analysis, wine list scanning, and batch AI scann
    - **Scan List** button to photograph wine lists and receipts for instant analysis
    - **Gemini price fallback** when Vivino has no pricing data
 
-### Importing Your Vivino Wines
+### Connecting Your Vivino Cellar
 
-Vivino has no usable public API for reading your own cellar — the website login
-and the `api.vivino.com` mobile backend are separate auth systems, so a
-server-side integration cannot obtain a token the API accepts. To bring your
-Vivino wines in, export them from your logged-in browser and import the CSV:
+Vivino has no public read API for your own cellar — the site uses a Rails
+session cookie and serves the cellar from an Inertia.js endpoint on
+`www.vivino.com` (not the `api.vivino.com` mobile backend). Cork Dork reads it
+by replaying a session cookie you paste from your browser.
 
-- See **[docs/vivino-import.md](docs/vivino-import.md)** for a copy-paste
-  browser-console exporter and step-by-step instructions.
-- Then use **📦 Inventory → Import CSV** to load the file, and optionally
-  **🍇 Vivino Batch Scan** to enrich the imported wines with ratings, pricing,
+- **[docs/vivino-import.md](docs/vivino-import.md)** has full instructions for
+  both methods:
+  - **Integration sync (recommended):** paste your cellar URL and session cookie
+    in **Cork Dork → Configure**, then use **🔄 Vivino Sync** (or enable twice-daily
+    auto-sync). When the cookie expires, a notification prompts you to refresh it.
+  - **One-time CSV export:** run a browser-console snippet and load the file via
+    **📦 Inventory → Import CSV**.
+- After importing, **🍇 Vivino Batch Scan** enriches wines with ratings, pricing,
   descriptions, and images from Vivino's public data.
 
 ## Default Cabinet Layout

@@ -23,8 +23,8 @@ from homeassistant.helpers.event import async_track_time_interval
 
 from .const import (
     CONF_VIVINO_AUTO_SYNC,
-    CONF_VIVINO_EMAIL,
-    CONF_VIVINO_PASSWORD,
+    CONF_VIVINO_CELLAR_URL,
+    CONF_VIVINO_SESSION_COOKIE,
     DOMAIN,
     FRONTEND_VERSION,
     VIVINO_AUTO_SYNC_INTERVAL_HOURS,
@@ -138,13 +138,13 @@ def _setup_vivino_account(hass: HomeAssistant, entry: ConfigEntry) -> None:
     if cancel:
         cancel()
 
-    email = entry.options.get(CONF_VIVINO_EMAIL, "").strip()
-    password = entry.options.get(CONF_VIVINO_PASSWORD, "")
-    if not email or not password:
+    cookie = entry.options.get(CONF_VIVINO_SESSION_COOKIE, "").strip()
+    cellar_url = entry.options.get(CONF_VIVINO_CELLAR_URL, "").strip()
+    if not cookie or not cellar_url:
         domain_data.pop("vivino_account", None)
         return
 
-    domain_data["vivino_account"] = VivinoAccountClient(hass, email, password)
+    domain_data["vivino_account"] = VivinoAccountClient(hass, cookie, cellar_url)
 
     if entry.options.get(CONF_VIVINO_AUTO_SYNC, False):
         async def _auto_sync(_now: Any) -> None:
@@ -153,8 +153,7 @@ def _setup_vivino_account(hass: HomeAssistant, entry: ConfigEntry) -> None:
             if not client or not storage:
                 return
             try:
-                # Same scope as the "all" target
-                await async_sync_from_vivino(hass, storage, client, sync_my_wines=True)
+                await async_sync_from_vivino(hass, storage, client)
             except Exception as err:
                 _LOGGER.warning("Scheduled Vivino sync failed: %s", err)
 

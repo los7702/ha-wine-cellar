@@ -1,172 +1,145 @@
-# Importing your Vivino wines into Cork Dork
+# Connecting your Vivino cellar to Cork Dork
 
-Vivino has no usable public read API for your own cellar. The website login is a
-Rails/Devise **HttpOnly session cookie** (no bearer token, invisible to page
-JavaScript), and the cellar itself is served by an **Inertia.js** endpoint on
-`www.vivino.com` — *not* the `api.vivino.com` mobile backend. A Home Assistant
-integration can't drive a browser to log in, so the reliable path is to export
-from your own logged-in browser and import the CSV.
+Vivino has no public read API for your own cellar. The website authenticates
+with a Rails/Devise **HttpOnly session cookie** (no bearer token) and serves the
+cellar from an **Inertia.js** endpoint on `www.vivino.com` — not the
+`api.vivino.com` mobile backend. Home Assistant can't drive a browser to log in,
+so you paste your **session cookie** and **cellar URL** once; the integration
+then reads the cellar on a schedule using that cookie.
 
-The trick: a script pasted into the browser console on `www.vivino.com` makes
-**same-origin** requests, so the HttpOnly session cookie is attached
-automatically — the script never needs to read it.
+When the cookie eventually expires, Cork Dork raises a notification asking you to
+paste a fresh one.
 
-## Step 1 — Export from Vivino (browser console)
+## Method A — Integration sync (recommended)
 
-1. In a desktop browser, log in to <https://www.vivino.com> and open your
-   **cellar** page (the URL looks like `https://www.vivino.com/sv/cellars/123456`).
-2. Open the developer console: `F12` (or `Cmd+Option+I` on macOS) → **Console**.
-3. Paste the whole script below and press **Enter**.
-4. It downloads `vivino-wines.csv`. If it can't locate your wine list it prints
-   the page's data structure instead — copy that console output and share it,
-   and the script can be finalized in one step.
+### 1. Find your cellar URL
+
+Log in to <https://www.vivino.com> in a desktop browser and open your **cellar**
+page. The URL looks like:
+
+```
+https://www.vivino.com/sv/cellars/5398850
+```
+
+Copy that whole URL.
+
+### 2. Copy your session cookie
+
+The session cookie is **HttpOnly**, so you must read it from the browser's
+developer tools (the `document.cookie` console trick won't show it):
+
+1. With vivino.com open and logged in, press `F12` → **Application** tab
+   (Chrome/Edge) or **Storage** tab (Firefox).
+2. In the left sidebar: **Cookies → https://www.vivino.com**.
+3. Find the row named **`_vivino_session`** and copy its **Value** (a long
+   string). That value is your session cookie.
+
+*Optional, more robust:* to also capture a longer-lived "remember me" cookie,
+use the **Network** tab instead — click any request to `www.vivino.com`, find
+**Request Headers → Cookie**, and copy the entire value. Paste that whole string
+(it contains `_vivino_session=…; remember_user_token=…; …`).
+
+### 3. Configure Cork Dork
+
+1. **Settings → Devices & Services → Cork Dork → Configure**.
+2. Paste the **cellar URL** and the **session cookie**.
+3. Optionally enable **Automatically sync the Vivino cellar twice a day**.
+4. Save. The cookie is verified against your cellar immediately — a wrong or
+   expired cookie is rejected with an error so you can fix it.
+
+### 4. Sync
+
+- Click **🔄 Vivino Sync** in the card header (or call the
+  `wine_cellar.sync_vivino` service) to import now.
+- Imported bottles land in the **Unassigned** tab; open any wine and use
+  **Move** to place it in a rack.
+- Only bottles you actually own (positive bottle count) are imported; your
+  personal star ratings and tasting notes come across too.
+
+> **Cookie lifetime:** Vivino sessions expire after a while. When that happens a
+> sync fails and Cork Dork shows a "Vivino session expired" notification — just
+> repeat steps 2–3 with a fresh cookie.
+
+## Method B — One-time CSV export (no config)
+
+If you'd rather not store a cookie, export once from your browser and import the
+CSV. On your **cellar** page, open the console (`F12` → **Console**), paste this,
+and press Enter — it downloads `vivino-wines.csv`:
 
 ```js
 (async () => {
-  // ── Read the Inertia page payload embedded in the cellar page ──────
   const appEl = document.getElementById("app") || document.querySelector("[data-page]");
-  if (!appEl || !appEl.dataset.page) {
-    console.warn("No Inertia #app[data-page] found. Are you on your cellar page (www.vivino.com/.../cellars/<id>)?");
-    return;
-  }
+  if (!appEl || !appEl.dataset.page) { console.warn("Open your cellar page first."); return; }
   const page0 = JSON.parse(appEl.dataset.page);
-  const version = page0.version;
-  const basePath = location.pathname;            // e.g. /sv/cellars/5398850
-  console.log("Inertia component:", page0.component, "| version present:", !!version);
-
-  // ── Recursively find the array of wine/cellar records in props ─────
-  const looksLikeWine = (o) =>
-    o && typeof o === "object" &&
-    (o.wine || o.vintage || (o.name && (o.winery || o.region)) ||
-     (o.vintage && o.vintage.wine));
-  const findWineArray = (node, path = "props") => {
+  const version = page0.version, basePath = location.pathname;
+  const looksLikeWine = (o) => o && typeof o === "object" &&
+    (o.wine || o.vintage || (o.name && (o.winery || o.region)));
+  const findWineArray = (node) => {
     let best = null;
-    const visit = (n, p) => {
+    const visit = (n) => {
       if (Array.isArray(n)) {
-        if (n.length && n.filter(looksLikeWine).length >= Math.ceil(n.length / 2)) {
-          if (!best || n.length > best.arr.length) best = { arr: n, path: p };
-        }
-        n.forEach((x, i) => visit(x, `${p}[${i}]`));
-      } else if (n && typeof n === "object") {
-        for (const k of Object.keys(n)) visit(n[k], `${p}.${k}`);
-      }
+        if (n.length && n.filter(looksLikeWine).length >= Math.ceil(n.length / 2) &&
+            (!best || n.length > best.length)) best = n.filter((x) => x && typeof x === "object");
+        n.forEach(visit);
+      } else if (n && typeof n === "object") Object.values(n).forEach(visit);
     };
-    visit(node, path);
-    return best;
+    visit(node); return best;
   };
-
-  // ── Fetch every page via the Inertia XHR protocol ─────────────────
   const fetchPage = async (n) => {
-    const url = `${basePath}?page=${n}`;
-    const r = await fetch(url, {
+    const r = await fetch(`${basePath}?page=${n}`, {
       headers: { "X-Inertia": "true", "X-Inertia-Version": version || "", "Accept": "application/json" },
       credentials: "include",
     });
-    if (r.status === 409) { console.warn("Inertia version changed — reload the page and re-run."); return null; }
-    if (!r.ok) return null;
-    return r.json();
+    return r.ok ? r.json() : null;
   };
-
-  const first = findWineArray(page0.props);
-  if (!first) {
-    console.warn("Could not locate the wine list in the page data. Structure follows:");
-    console.log("props keys:", Object.keys(page0.props || {}));
-    console.log(JSON.stringify(page0.props, null, 2).slice(0, 4000));
-    console.log("^ Share this so the exporter can target the right field.");
-    return;
-  }
-  console.log("Found wines at:", first.path, "— page 1 count:", first.arr.length);
-
-  const all = [];
-  const seen = new Set();
-  const collect = (arr) => {
-    for (const rec of arr) {
-      const id = rec.id || (rec.vintage && rec.vintage.id) || JSON.stringify(rec).length + ":" + (rec.name || "");
-      if (seen.has(id)) continue;
-      seen.add(id); all.push(rec);
-    }
-  };
-  collect(first.arr);
-
+  const all = [], seen = new Set();
+  const collect = (arr) => arr.forEach((rec) => {
+    const id = rec.id || (rec.vintage && rec.vintage.id) || (rec.name || "") + Math.random();
+    if (!seen.has(id)) { seen.add(id); all.push(rec); }
+  });
+  let first = findWineArray(page0.props);
+  if (!first) { console.warn("Wine list not found. props keys:", Object.keys(page0.props||{})); console.log(JSON.stringify(page0.props,null,2).slice(0,4000)); return; }
+  collect(first);
   for (let n = 2; n <= 100; n++) {
-    const pg = await fetchPage(n);
-    if (!pg || !pg.props) break;
-    const found = findWineArray(pg.props);
-    if (!found || !found.arr.length) break;
-    const before = all.length;
-    collect(found.arr);
-    if (all.length === before) break;                 // no new records → done
-    if (found.arr.length < first.arr.length) break;   // last (partial) page
+    const pg = await fetchPage(n); if (!pg || !pg.props) break;
+    const f = findWineArray(pg.props); if (!f || !f.length) break;
+    const before = all.length; collect(f); if (all.length === before) break;
   }
-  console.log("Total wines collected:", all.length);
-
-  // ── Map to Cork Dork CSV columns ──────────────────────────────────
   const TYPE = { 1: "red", 2: "white", 3: "sparkling", 4: "rosé", 7: "dessert" };
-  const g = (o, ...ks) => { for (const k of ks) { if (o && o[k] != null) return o[k]; } return undefined; };
-  const csvCell = (v) => {
-    const s = v == null ? "" : String(v);
-    return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
-  };
-  const cols = ["name","winery","vintage","type","region","country","grape variety",
-                "rating","ratings count","user rating","alcohol","notes"];
+  const cell = (v) => { const s = v == null ? "" : String(v); return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
+  const cols = ["name","winery","vintage","type","region","country","grape variety","rating","ratings count","user rating","alcohol","notes"];
   const rows = [cols.join(",")];
-  let owned = 0, skipped = 0;
   for (const rec of all) {
-    const vintage = rec.vintage || rec;
-    const wine = vintage.wine || rec.wine || rec;
-    const name = g(wine, "name") || g(vintage, "name");
-    if (!name) continue;
-    const count = g(rec, "cellar_count", "bottle_count", "count", "quantity", "amount");
-    if (count != null && Number(count) <= 0) { skipped++; continue; }
-    if (count != null) owned++;
-    const winery = (wine.winery || {}).name || "";
-    const region = wine.region || {};
-    const country = (region.country || {}).name || "";
-    const grapes = (wine.grapes || []).map((x) => x.name).filter(Boolean).join(", ");
-    const stats = wine.statistics || vintage.statistics || {};
-    const review = rec.user_review || rec.review || vintage.user_review || {};
-    let year = parseInt(g(vintage, "year"), 10);
-    if (!year || year < 1800) year = "";
-    const uRating = g(review, "rating") || g(rec, "user_rating");
-    rows.push([
-      name, winery, year, TYPE[wine.type_id] || g(wine, "type") || "red",
-      region.name || "", country, grapes,
-      stats.ratings_average ? Number(stats.ratings_average).toFixed(1) : "",
-      stats.ratings_count || "",
-      uRating ? Math.round(uRating * 2) / 2 : "",
-      wine.alcohol ? wine.alcohol + "%" : "",
-      (g(review, "note") || "").replace(/\s+/g, " ").trim(),
-    ].map(csvCell).join(","));
+    const vintage = rec.vintage || rec, wine = vintage.wine || rec.wine || rec;
+    const name = wine.name || vintage.name; if (!name) continue;
+    const count = rec.cellar_count ?? rec.bottle_count ?? rec.count;
+    if (count != null && Number(count) <= 0) continue;
+    const region = wine.region || {}, review = rec.user_review || rec.review || {};
+    const stats = wine.statistics || {};
+    let year = parseInt(vintage.year, 10); if (!year || year < 1800) year = "";
+    rows.push([name,(wine.winery||{}).name||"",year,TYPE[wine.type_id]||"red",region.name||"",
+      (region.country||{}).name||"",(wine.grapes||[]).map(x=>x.name).filter(Boolean).join(", "),
+      stats.ratings_average?Number(stats.ratings_average).toFixed(1):"",stats.ratings_count||"",
+      review.rating?Math.round(review.rating*2)/2:"",wine.alcohol?wine.alcohol+"%":"",
+      (review.note||"").replace(/\s+/g," ").trim()].map(cell).join(","));
   }
-
-  if (rows.length < 2) { console.warn("No wines mapped — share the structure printed above."); return; }
-  const blob = new Blob([rows.join("\n")], { type: "text/csv" });
+  if (rows.length < 2) { console.warn("No owned wines found."); return; }
   const a = document.createElement("a");
-  a.href = URL.createObjectURL(blob);
-  a.download = "vivino-wines.csv";
-  a.click();
-  console.log(`Exported ${rows.length - 1} wines to vivino-wines.csv (owned=${owned}, skipped no-bottle=${skipped}).`);
+  a.href = URL.createObjectURL(new Blob([rows.join("\n")], { type: "text/csv" }));
+  a.download = "vivino-wines.csv"; a.click();
+  console.log(`Exported ${rows.length - 1} wines.`);
 })();
 ```
 
-## Step 2 — Import into Cork Dork
+Then in Cork Dork: **📦 Inventory → Import CSV** and choose the file.
 
-1. Open your Cork Dork card → **📦 Inventory**.
-2. Click **Import CSV** and choose the `vivino-wines.csv` file.
-3. The wines are added to your cellar (unassigned). Open any wine and use
-   **Move** to place it into a rack.
+## Troubleshooting
 
-Tip: after importing, use **🍇 Vivino Batch Scan** to enrich the wines with the
-latest ratings, prices, descriptions, and images from Vivino's public data.
-
-## Notes
-
-- The script only exports bottles you actually own (records with a positive
-  bottle count); pure ratings without bottles are skipped.
-- If the console prints a data structure instead of downloading a file, share
-  that output — it means Vivino's field names differ from the defaults and the
-  mapping can be pointed at the right keys.
-- A fully automated (no-browser) version is possible with Playwright driving the
-  login, then reusing the session cookie against the same Inertia endpoint —
-  see `scripts/vivino_login_framework.py` for a starting template. Home
-  Assistant itself can't run a browser, so this stays a local companion tool.
+- **"Vivino returned a web page instead of cellar data"** — the cookie is wrong
+  or expired. Re-copy `_vivino_session` (step 2).
+- **Sync reports "no recognizable wine list"** with a list of `props keys` in the
+  Home Assistant log — Vivino changed the cellar data shape. Share that log line
+  (or the console output from Method B) so the parser can be pointed at the new
+  fields.
+- After importing, use **🍇 Vivino Batch Scan** to enrich wines with the latest
+  ratings, prices, descriptions, and images from Vivino's public data.

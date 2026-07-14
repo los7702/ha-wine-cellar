@@ -1,24 +1,30 @@
-"""Vivino account connection: sync your Vivino cellar and wishlist.
+"""Vivino cellar connection via the website's Inertia.js endpoint.
 
-Vivino has no official public API. This client uses the same endpoints the
-Vivino web app uses:
+Vivino has no public read API for your own cellar. The website authenticates
+with a Rails/Devise **HttpOnly session cookie** (no bearer token, invisible to
+page JavaScript) and serves the cellar from an **Inertia.js** endpoint on
+``www.vivino.com`` — not the ``api.vivino.com`` mobile backend.
 
-- ``POST https://www.vivino.com/api/login`` with ``{email, password}``
-  authenticates and returns the user profile with an API token.
-- ``https://api.vivino.com`` serves user data (``/users/me``,
-  ``/users/{id}/cellar``, ``/users/{id}/wishlist``) with a Bearer token.
+Home Assistant cannot drive a browser to log in, so the user pastes their
+Vivino session cookie (copied once from their browser) plus their cellar page
+URL. This client replays that cookie against the Inertia cellar endpoint with
+the ``X-Inertia`` headers, pages through the results, and parses the wine
+records. When the cookie expires the endpoint stops returning JSON, which is
+surfaced as an auth error so the integration can prompt for a fresh cookie.
 
-Endpoint shapes are unofficial and may change, so all parsing is defensive:
-records are matched against several known layouts and unknown fields are
-ignored rather than raising.
+Endpoint/response shapes are unofficial and may change, so parsing is
+defensive: the wine list is located structurally within the Inertia props and
+unknown fields are ignored rather than raising.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urlparse
 
 import aiohttp
 
@@ -29,31 +35,19 @@ from .const import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
-LOGIN_URL = "https://www.vivino.com/api/login"
-API_BASE = "https://api.vivino.com"
+WWW_BASE = "https://www.vivino.com"
+HOME_URL = WWW_BASE + "/"
 
 REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=30)
-PAGE_SIZE = 50
-MAX_PAGES = 40  # safety cap: 2000 records
+MAX_PAGES = 60  # safety cap
 
 HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     ),
     "Accept": "application/json",
 }
-
-# Keys that may hold the API token in the login response
-_TOKEN_KEYS = (
-    "token", "api_token", "access_token", "jwt",
-    "oauth_token", "bearer_token", "session_token",
-)
-# Keys that may hold the record list in cellar/wishlist responses
-_LIST_KEYS = (
-    "cellar", "cellar_wines", "user_cellar", "wishlist", "user_wines",
-    "user_vintages", "records", "items", "matches", "vintages",
-)
 
 
 class VivinoAuthError(Exception):
@@ -64,34 +58,80 @@ class VivinoConnectionError(Exception):
     """Raised when Vivino cannot be reached (network/server trouble)."""
 
 
+def _normalize_cookie(raw: str) -> str:
+    """Normalize a pasted cookie into a Cookie header value.
+
+    Accepts a full ``name=value; name2=value2`` header (best — copied from the
+    browser's Network tab), a single ``_vivino_session=...`` pair, or a bare
+    session value (wrapped as ``_vivino_session=<value>``).
+    """
+    raw = (raw or "").strip().strip(";").strip()
+    if "=" in raw:
+        return raw
+    return f"_vivino_session={raw}"
+
+
+def _cellar_path(cellar_url: str) -> str:
+    """Extract the path (e.g. /sv/cellars/5398850) from a cellar URL."""
+    raw = (cellar_url or "").strip()
+    if not raw:
+        return ""
+    if "://" in raw:
+        parsed = urlparse(raw)
+        return parsed.path or "/"
+    return raw if raw.startswith("/") else "/" + raw
+
+
+def _looks_like_wine(obj: Any) -> bool:
+    """Heuristic: does this object look like a cellar/wine record?"""
+    if not isinstance(obj, dict):
+        return False
+    if isinstance(obj.get("wine"), dict) or isinstance(obj.get("vintage"), dict):
+        return True
+    return bool(obj.get("name")) and (
+        bool(obj.get("winery")) or bool(obj.get("region"))
+    )
+
+
+def _find_wine_array(node: Any) -> list[dict[str, Any]]:
+    """Recursively locate the largest array of wine-like records in Inertia props."""
+    best: list[dict[str, Any]] = []
+
+    def visit(n: Any) -> None:
+        nonlocal best
+        if isinstance(n, list):
+            wine_like = [x for x in n if _looks_like_wine(x)]
+            if n and len(wine_like) >= max(1, len(n) // 2) and len(n) > len(best):
+                best = [x for x in n if isinstance(x, dict)]
+            for x in n:
+                visit(x)
+        elif isinstance(n, dict):
+            for v in n.values():
+                visit(v)
+
+    visit(node)
+    return best
+
+
 class VivinoAccountClient:
-    """Authenticated client for a user's Vivino account."""
+    """Reads a user's Vivino cellar via the Inertia endpoint using a session cookie."""
 
-    def __init__(self, hass: HomeAssistant, email: str, password: str) -> None:
-        """Initialize with account credentials."""
+    def __init__(self, hass: HomeAssistant, session_cookie: str, cellar_url: str) -> None:
+        """Initialize with a pasted session cookie and the cellar page URL."""
         self._hass = hass
-        self._email = email
-        self._password = password
-        # Dedicated session: login sets Vivino cookies which must not leak
-        # into (or be polluted by) HA's shared client session.
-        self._session: aiohttp.ClientSession | None = None
-        self._token: str | None = None
-        self._user_id: int | None = None
+        self._cookie = _normalize_cookie(session_cookie)
+        self._path = _cellar_path(cellar_url)
+        self._version: str | None = None
+        # Kept for compatibility with the shared sync/sensor code.
         self.alias: str = ""
-        # True once a freshly logged-in session was still rejected; stops
-        # every subsequent request from hammering the login endpoint again.
+        self.user_id: int | None = None
         self._session_rejected = False
-        # Ground-truth about the last login/token resolution, surfaced in the
-        # sync result so auth problems can be diagnosed without log-diving.
         self.token_diagnostics: dict[str, Any] = {}
-
-    @property
-    def user_id(self) -> int | None:
-        """Return the Vivino user ID once logged in."""
-        return self._user_id
+        # Dedicated session so Vivino cookies never leak into HA's shared one.
+        self._session: aiohttp.ClientSession | None = None
 
     def reset_session_backoff(self) -> None:
-        """Allow one fresh re-login attempt (called at the start of a sync)."""
+        """No-op kept for API parity with the previous client."""
         self._session_rejected = False
 
     def _get_session(self) -> aiohttp.ClientSession:
@@ -100,343 +140,147 @@ class VivinoAccountClient:
             self._session = async_create_clientsession(self._hass)
         return self._session
 
-    # ── Authentication ───────────────────────────────────────────────
+    def _headers(self, inertia: bool = False) -> dict[str, str]:
+        h = {**HEADERS, "Cookie": self._cookie}
+        if inertia:
+            h["X-Inertia"] = "true"
+            h["X-Requested-With"] = "XMLHttpRequest"
+            if self._version:
+                h["X-Inertia-Version"] = self._version
+        return h
 
-    async def async_login(self) -> dict[str, Any]:
-        """Log in to Vivino and capture the API token and user id.
-
-        Returns the user profile dict from the login response.
-        Raises VivinoAuthError on bad credentials or unexpected responses.
-        """
+    async def _refresh_version(self) -> str | None:
+        """Read the current Inertia asset version from the homepage."""
         session = self._get_session()
-        payload = {"email": self._email, "password": self._password}
-
-        try:
-            async with session.post(
-                LOGIN_URL, json=payload, headers=HEADERS, timeout=REQUEST_TIMEOUT
-            ) as resp:
-                try:
-                    data = await resp.json(content_type=None)
-                except ValueError:
-                    data = {}
-
-                if resp.status >= 500:
-                    raise VivinoConnectionError(
-                        f"Vivino is unreachable (HTTP {resp.status})"
-                    )
-                if resp.status != 200 or not isinstance(data, dict):
-                    message = ""
-                    if isinstance(data, dict):
-                        err = data.get("error")
-                        if isinstance(err, dict):
-                            message = err.get("message", "")
-                        elif isinstance(err, str):
-                            message = err
-                    raise VivinoAuthError(
-                        message or f"Vivino login failed (HTTP {resp.status})"
-                    )
-        except (VivinoAuthError, VivinoConnectionError):
-            raise
-        except Exception as err:
-            raise VivinoConnectionError(
-                f"Vivino login request failed: {err}"
-            ) from err
-
-        user = data.get("user") if isinstance(data.get("user"), dict) else data
-        user_id = user.get("id") or data.get("id") or data.get("user_id")
-        if isinstance(user_id, int):
-            self._user_id = user_id
-        self.alias = str(user.get("alias") or user.get("seo_name") or "")
-
-        if not self._user_id:
-            raise VivinoAuthError(
-                "Vivino login succeeded but no user id was returned"
-            )
-
-        # A Vivino login can hand back several token-like fields, and only
-        # some are valid Bearer tokens for api.vivino.com. Rather than guess
-        # which field/source is right, collect every candidate and use the
-        # first one that actually authenticates against a probe endpoint.
-        self._token = await self._async_resolve_token(data)
-        if not self._token:
-            _LOGGER.warning(
-                "Vivino login succeeded but no working API token was found "
-                "(login response keys: %s); cellar/wishlist requests will "
-                "be rejected",
-                list(data.keys()),
-            )
-
-        _LOGGER.debug(
-            "Logged in to Vivino as user %s (%s), token: %s",
-            self._user_id, self.alias, "yes" if self._token else "no",
-        )
-        return user
-
-    async def _async_resolve_token(self, data: dict[str, Any]) -> str | None:
-        """Return the first candidate token that authenticates, or None.
-
-        Candidates are gathered from the login response fields, then the
-        logged-in web app pages, then session cookies. Each is probed against
-        the user endpoint; the first that returns 200 wins. If none can be
-        validated (e.g. Vivino is rate-limiting), fall back to the
-        highest-priority candidate so a transient probe failure doesn't
-        discard an otherwise-good token.
-        """
-        candidates: list[str] = []
-        sources: list[str] = []
-
-        def _add(token: str | None, source: str) -> None:
-            if token and token not in candidates:
-                candidates.append(token)
-                sources.append(source)
-
-        for token in self._extract_tokens(data):
-            _add(token, "login")
-        _add(await self._async_scrape_token(), "page")
-        for token in self._cookie_tokens():
-            _add(token, "cookie")
-
-        # Record what we found, without leaking token values
-        self.token_diagnostics = {
-            "login_response_keys": sorted(data.keys()),
-            "candidate_count": len(candidates),
-            "candidate_sources": sources,
-            "validated": False,
-            "validated_source": None,
-            "probe_status": None,
-        }
-
-        if not candidates:
-            return None
-
-        for token, source in zip(candidates, sources):
-            status = await self._async_token_probe_status(token)
-            self.token_diagnostics["probe_status"] = status
-            if status == 200:
-                self.token_diagnostics["validated"] = True
-                self.token_diagnostics["validated_source"] = source
-                _LOGGER.debug(
-                    "Validated Vivino API token from %s (%d candidates)",
-                    source, len(candidates),
-                )
-                return token
-
-        _LOGGER.debug(
-            "No Vivino token could be validated; using best-effort candidate"
-        )
-        return candidates[0]
-
-    async def _async_token_probe_status(self, token: str) -> int | None:
-        """Probe a token against the user endpoint; return the status code."""
-        session = self._get_session()
-        headers = {**HEADERS, "Authorization": f"Bearer {token}"}
         try:
             async with session.get(
-                f"{API_BASE}/users/{self._user_id}",
-                headers=headers, timeout=REQUEST_TIMEOUT,
+                HOME_URL, headers={**HEADERS, "Cookie": self._cookie,
+                                   "Accept": "text/html"},
+                timeout=REQUEST_TIMEOUT, allow_redirects=True,
             ) as resp:
-                return resp.status
+                html = await resp.text()
         except Exception as err:
-            _LOGGER.debug("Token probe failed: %s", err)
-            return None
-
-    def _cookie_tokens(self) -> list[str]:
-        """Return token-like values from the session cookie jar."""
-        tokens: list[str] = []
-        try:
-            for cookie in self._get_session().cookie_jar:
-                if "token" in cookie.key.lower() and len(cookie.value) > 20:
-                    tokens.append(cookie.value)
-        except Exception as err:
-            _LOGGER.debug("Cookie jar token scan failed: %s", err)
-        return tokens
-
-    async def _async_scrape_token(self) -> str | None:
-        """Extract the API bearer token from a logged-in Vivino web page."""
-        session = self._get_session()
-        headers = {**HEADERS, "Accept": "text/html"}
-        for url in ("https://www.vivino.com/wines", "https://www.vivino.com/"):
+            raise VivinoConnectionError(f"Could not reach Vivino: {err}") from err
+        m = re.search(r'data-page="([^"]+)"', html)
+        if m:
+            raw = (m.group(1).replace("&quot;", '"').replace("&amp;", "&")
+                   .replace("&#39;", "'"))
             try:
-                async with session.get(
-                    url, headers=headers, timeout=REQUEST_TIMEOUT,
-                    allow_redirects=True,
-                ) as resp:
-                    if resp.status != 200:
-                        continue
-                    html = await resp.text()
-                match = re.search(
-                    r'"(?:api_token|apiToken|access_token|accessToken'
-                    r'|oauth_token|oauthToken|bearer_token|bearerToken)"'
-                    r'\s*:\s*"([A-Za-z0-9._\-]{20,})"',
-                    html,
-                )
-                if match:
-                    _LOGGER.debug("Scraped Vivino API token from %s", url)
-                    return match.group(1)
-            except Exception as err:
-                _LOGGER.debug("Token scrape from %s failed: %s", url, err)
-        return None
+                self._version = json.loads(raw).get("version")
+            except Exception:
+                vm = re.search(r'\\?"version\\?":\\?"([^"\\]+)', raw)
+                self._version = vm.group(1) if vm else None
+        return self._version
 
-    @staticmethod
-    def _extract_tokens(data: dict[str, Any]) -> list[str]:
-        """Return all token-like values from the login response, in order."""
-        tokens: list[str] = []
-        containers: list[dict[str, Any]] = [data]
-        for key in ("user", "session", "auth"):
-            nested = data.get(key)
-            if isinstance(nested, dict):
-                containers.append(nested)
-        for container in containers:
-            for key in _TOKEN_KEYS:
-                token = container.get(key)
-                if isinstance(token, str) and len(token) > 10 and token not in tokens:
-                    tokens.append(token)
-        return tokens
+    async def _inertia_get(self, page: int) -> dict[str, Any]:
+        """Fetch one page of the Inertia cellar props.
 
-    async def async_verify(self) -> dict[str, Any]:
-        """Verify credentials work; returns the user profile."""
-        return await self.async_login()
-
-    # ── Authenticated requests ───────────────────────────────────────
-
-    async def _api_get(self, path: str, params: dict[str, Any] | None = None) -> Any:
-        """GET from api.vivino.com with auth, re-logging-in once on 401/403."""
-        if self._user_id is None:
-            await self.async_login()
+        Raises VivinoAuthError if the session cookie is missing/expired (the
+        endpoint then serves an HTML login page instead of Inertia JSON).
+        """
+        if not self._path:
+            raise VivinoAuthError("No Vivino cellar URL configured")
+        session = self._get_session()
+        url = f"{WWW_BASE}{self._path}?page={page}"
 
         for attempt in (1, 2):
-            session = self._get_session()
-            headers = dict(HEADERS)
-            if self._token:
-                headers["Authorization"] = f"Bearer {self._token}"
-
-            had_token = self._token is not None
-            async with session.get(
-                f"{API_BASE}/{path.lstrip('/')}",
-                params=params,
-                headers=headers,
-                timeout=REQUEST_TIMEOUT,
-            ) as resp:
-                if (
-                    resp.status in (401, 403)
-                    and attempt == 1
-                    and not self._session_rejected
-                ):
-                    _LOGGER.debug(
-                        "Vivino API %s returned %s, re-authenticating",
-                        path, resp.status,
-                    )
-                    self._token = None
-                    await self.async_login()
-                    continue
-                if resp.status in (401, 403):
-                    self._session_rejected = True
-                    # Include everything needed to diagnose remotely: did we
-                    # even have a token, and what did Vivino answer?
-                    server_msg = ""
-                    try:
-                        body = await resp.json(content_type=None)
-                        err = body.get("error") if isinstance(body, dict) else None
-                        if isinstance(err, dict):
-                            server_msg = err.get("message", "")
-                        elif isinstance(err, str):
-                            server_msg = err
-                    except Exception:
-                        pass
-                    detail = f"HTTP {resp.status}"
-                    detail += ", bearer token attached" if had_token else (
-                        ", NO bearer token available"
-                    )
-                    if server_msg:
-                        detail += f", Vivino says: {server_msg!r}"
-                    raise VivinoAuthError(
-                        f"Vivino rejected the session for {path} ({detail})"
-                    )
-                if resp.status == 429:
-                    raise RuntimeError(
-                        f"Vivino is rate-limiting requests ({path} returned "
-                        "HTTP 429) — wait a while before syncing again"
-                    )
-                if resp.status != 200:
-                    raise RuntimeError(
-                        f"Vivino API {path} returned HTTP {resp.status}"
-                    )
-                self._session_rejected = False
-                return await resp.json(content_type=None)
-        return None
-
-    async def _fetch_paginated(self, path: str) -> list[dict[str, Any]]:
-        """Fetch all pages of a user list endpoint."""
-        records: list[dict[str, Any]] = []
-        for page in range(1, MAX_PAGES + 1):
-            data = await self._api_get(
-                path, params={"page": page, "limit": PAGE_SIZE}
-            )
-            batch = _extract_records(data)
-            if not batch:
-                if page == 1 and data:
-                    # Response wasn't empty but had no recognizable record
-                    # list — log its shape so parse failures are diagnosable.
-                    _LOGGER.warning(
-                        "Vivino %s response had no recognizable records "
-                        "(type: %s, keys: %s)",
-                        path,
-                        type(data).__name__,
-                        list(data.keys()) if isinstance(data, dict) else "n/a",
-                    )
-                break
-            records.extend(batch)
-            if len(batch) < PAGE_SIZE:
-                break
-        return records
-
-    async def _fetch_first_working(self, paths: tuple[str, ...]) -> list[dict[str, Any]]:
-        """Fetch records from the first endpoint variant that responds.
-
-        An endpoint that answers successfully with zero records is a valid
-        outcome (an empty cellar/list) and stops the fallback chain; only
-        rejected/failed endpoints advance to the next variant.
-        """
-        last_err: Exception | None = None
-        for path in paths:
             try:
-                return await self._fetch_paginated(path)
-            except (VivinoAuthError, RuntimeError) as err:
-                _LOGGER.debug("Vivino endpoint %s failed: %s", path, err)
-                last_err = err
-        if last_err:
-            raise last_err
-        return []
+                async with session.get(
+                    url, headers=self._headers(inertia=True),
+                    timeout=REQUEST_TIMEOUT, allow_redirects=False,
+                ) as resp:
+                    # Inertia version drift → refresh and retry once
+                    if resp.status == 409 and attempt == 1:
+                        self._version = resp.headers.get("X-Inertia-Version")
+                        if not self._version:
+                            await self._refresh_version()
+                        continue
+                    # A redirect (to the login page) means the cookie is dead
+                    if resp.status in (301, 302, 303, 307, 308):
+                        raise VivinoAuthError(
+                            "Vivino redirected to login — the session cookie is "
+                            "missing or expired; paste a fresh one"
+                        )
+                    if resp.status == 401 or resp.status == 403:
+                        raise VivinoAuthError(
+                            "Vivino rejected the session cookie (HTTP "
+                            f"{resp.status}) — paste a fresh one"
+                        )
+                    if resp.status != 200:
+                        raise RuntimeError(
+                            f"Vivino cellar page returned HTTP {resp.status}"
+                        )
+                    text = await resp.text()
+            except (VivinoAuthError, VivinoConnectionError, RuntimeError):
+                raise
+            except Exception as err:
+                raise VivinoConnectionError(
+                    f"Vivino request failed: {err}"
+                ) from err
+
+            try:
+                data = json.loads(text)
+            except ValueError:
+                # Got HTML instead of Inertia JSON → not authenticated
+                raise VivinoAuthError(
+                    "Vivino returned a web page instead of cellar data — the "
+                    "session cookie is missing or expired; paste a fresh one"
+                )
+            props = data.get("props") if isinstance(data, dict) else None
+            return props if isinstance(props, dict) else {}
+        return {}
+
+    async def async_verify(self) -> dict[str, Any]:
+        """Validate the cookie + cellar URL by fetching the first page."""
+        await self._refresh_version()
+        props = await self._inertia_get(1)
+        wines = _find_wine_array(props)
+        return {"reachable": True, "first_page_wines": len(wines)}
 
     async def async_get_cellar(self) -> list[dict[str, Any]]:
         """Return the user's Vivino cellar as parsed wine dicts."""
-        raw = await self._fetch_first_working(
-            (f"users/{self._user_id}/cellar", "cellars")
-        )
-        wines = [w for w in (_parse_user_wine(r) for r in raw) if w]
-        _log_parse_outcome("cellar", raw, wines)
+        if self._version is None:
+            await self._refresh_version()
+
+        records: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for page in range(1, MAX_PAGES + 1):
+            props = await self._inertia_get(page)
+            batch = _find_wine_array(props)
+            if not batch:
+                if page == 1 and props:
+                    _LOGGER.warning(
+                        "Vivino cellar page had no recognizable wine list; "
+                        "props keys: %s", list(props.keys()),
+                    )
+                break
+            new = 0
+            for rec in batch:
+                rid = str(
+                    rec.get("id")
+                    or (rec.get("vintage") or {}).get("id")
+                    or f"{page}:{rec.get('name','')}"
+                )
+                if rid in seen:
+                    continue
+                seen.add(rid)
+                records.append(rec)
+                new += 1
+            if new == 0:  # nothing new on this page → done
+                break
+
+        wines = [w for w in (_parse_user_wine(r) for r in records) if w]
+        _log_parse_outcome("cellar", records, wines)
         return wines
 
     async def async_get_wishlist(self) -> list[dict[str, Any]]:
-        """Return the user's Vivino wishlist as parsed wine dicts."""
-        raw = await self._fetch_paginated(f"users/{self._user_id}/wishlist")
-        wines = [w for w in (_parse_user_wine(r) for r in raw) if w]
-        _log_parse_outcome("wishlist", raw, wines)
-        return wines
+        """Wishlist import is not supported via the Inertia cellar endpoint."""
+        return []
 
     async def async_get_my_wines(self) -> list[dict[str, Any]]:
-        """Return the user's rated/scanned wines ("My Wines").
+        """"My Wines" import is not supported via the Inertia cellar endpoint."""
+        return []
 
-        Unlike the cellar (a Vivino Premium feature), this covers every wine
-        the user has rated or scanned. Two endpoint variants exist; try the
-        user-scoped one first.
-        """
-        raw = await self._fetch_first_working(
-            (f"users/{self._user_id}/vintages", "user_vintages")
-        )
-        wines = [w for w in (_parse_user_wine(r) for r in raw) if w]
-        _log_parse_outcome("my wines", raw, wines)
-        return wines
 
 
 # ── Response parsing ─────────────────────────────────────────────────
@@ -454,24 +298,6 @@ def _log_parse_outcome(
         )
     else:
         _LOGGER.debug("Fetched %d %s wines from Vivino", len(wines), what)
-
-
-def _extract_records(data: Any) -> list[dict[str, Any]]:
-    """Pull the record list out of a cellar/wishlist response."""
-    if isinstance(data, list):
-        return [r for r in data if isinstance(r, dict)]
-    if not isinstance(data, dict):
-        return []
-    for key in _LIST_KEYS:
-        value = data.get(key)
-        if isinstance(value, list):
-            return [r for r in value if isinstance(r, dict)]
-    # Single-key wrapper object, e.g. {"whatever": [...]}
-    if len(data) == 1:
-        value = next(iter(data.values()))
-        if isinstance(value, list):
-            return [r for r in value if isinstance(r, dict)]
-    return []
 
 
 def _parse_user_wine(record: dict[str, Any]) -> dict[str, Any] | None:
@@ -557,10 +383,10 @@ def _parse_user_wine(record: dict[str, Any]) -> dict[str, Any] | None:
                 break
         bottle_count = owned_count if owned_count and owned_count > 0 else 1
 
-        # The user's own rating/note (present on "My Wines" records)
+        # The user's own rating/note (present on cellar / "My Wines" records)
         user_rating = None
         user_note = ""
-        review = record.get("review")
+        review = record.get("user_review") or record.get("review")
         if isinstance(review, dict):
             ur = review.get("rating")
             if isinstance(ur, (int, float)) and 0 < ur <= 5:
@@ -767,6 +593,30 @@ async def async_sync_from_vivino(
 
     # Always fire so the card and the Vivino sync sensor refresh
     hass.bus.async_fire(f"{DOMAIN}_updated")
+
+    # Prompt the user to refresh the cookie when the session has expired;
+    # clear the prompt once a sync authenticates again.
+    try:
+        from homeassistant.components import persistent_notification
+        auth_failed = any(
+            "cookie" in e.lower() or "session" in e.lower()
+            for e in result["errors"]
+        )
+        if auth_failed and not result["cellar_imported"]:
+            persistent_notification.async_create(
+                hass,
+                "Cork Dork could not read your Vivino cellar — the session "
+                "cookie has expired. Open Settings > Devices & Services > "
+                "Cork Dork > Configure and paste a fresh Vivino session cookie.",
+                title="Vivino session expired",
+                notification_id="wine_cellar_vivino_reauth",
+            )
+        elif not result["errors"]:
+            persistent_notification.async_dismiss(
+                hass, "wine_cellar_vivino_reauth"
+            )
+    except Exception:  # notifications are best-effort
+        pass
 
     _LOGGER.info(
         "Vivino sync: %d/%d cellar bottles, %d/%d my-wines, %d/%d wishlist "

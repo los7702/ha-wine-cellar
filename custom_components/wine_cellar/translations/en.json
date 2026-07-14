@@ -15,20 +15,20 @@
     "step": {
       "init": {
         "title": "Cork Dork Options",
-        "description": "Vivino credentials are verified against Vivino when you save.",
+        "description": "To sync your Vivino cellar, paste your cellar page URL and your Vivino session cookie (see the docs: docs/vivino-import.md). The cookie is verified against your cellar when you save.",
         "data": {
           "default_wine_type": "Default wine type for new entries",
           "gemini_api_key": "Google Gemini API key (for AI label recognition)",
-          "vivino_email": "Vivino account email (for cellar/wishlist sync)",
-          "vivino_password": "Vivino account password",
-          "vivino_auto_sync": "Automatically sync Vivino cellar twice a day"
+          "vivino_cellar_url": "Vivino cellar page URL (e.g. https://www.vivino.com/sv/cellars/123456)",
+          "vivino_session_cookie": "Vivino session cookie (from your logged-in browser)",
+          "vivino_auto_sync": "Automatically sync the Vivino cellar twice a day"
         }
       }
     },
     "error": {
-      "vivino_invalid_auth": "Vivino sign-in failed — check your email and password.",
+      "vivino_invalid_auth": "Vivino rejected the session cookie — it may be expired or wrong. Paste a fresh one from your logged-in browser.",
       "vivino_cannot_connect": "Could not reach Vivino — check your network connection and try again.",
-      "vivino_incomplete": "Enter both a Vivino email and password, or leave both empty to disable the connection."
+      "vivino_incomplete": "Enter both the cellar URL and the session cookie, or leave both empty to disable the connection."
     }
   }
 }
