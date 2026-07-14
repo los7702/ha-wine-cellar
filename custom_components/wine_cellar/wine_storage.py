@@ -378,6 +378,36 @@ class WineCellarStorage:
         """Store the last Vivino sync result (persisted across restarts)."""
         self._data["vivino_sync_status"] = status
 
+    def remove_vivino_bottles(
+        self, vivino_id: str, count: int, reason: str = "removed_on_vivino"
+    ) -> int:
+        """Remove up to ``count`` Vivino-sourced bottles for a vivino_id.
+
+        Prefers unassigned bottles (not placed in a rack) so a Vivino-side
+        removal disturbs the user's physical layout as little as possible.
+        Each removed bottle is archived to history. Returns the count removed.
+        """
+        if count <= 0:
+            return 0
+        matching = [
+            w for w in self._data.get(CONF_WINES, [])
+            if w.get("vivino_id") == vivino_id
+            and str(w.get("source", "")).startswith("vivino")
+        ]
+        # Unassigned (no cabinet) first, then by most recently added
+        matching.sort(
+            key=lambda w: (
+                0 if not w.get("cabinet_id") else 1,
+                w.get("added_at", ""),
+            ),
+            reverse=False,
+        )
+        removed = 0
+        for wine in matching[:count]:
+            if self.remove_wine(wine["id"], reason=reason):
+                removed += 1
+        return removed
+
     def get_vivino_baseline(self) -> dict[str, Any]:
         """Return the last-synced Vivino cellar baseline (vivino_id -> entry)."""
         base = self._data.get("vivino_baseline")

@@ -132,12 +132,19 @@ def reconcile(
         v = vivino_state.get(vid, {}).get("count", 0)
         c = corkdork_counts.get(vid, 0)
 
+        # First sync (no baseline): this is initialization, not a set of edits.
+        # Mirror Vivino into Cork Dork; never push or flag conflicts.
+        if first_sync:
+            if c != v:
+                _emit_delta(plan, vid, vivino_state, c, v)
+            continue
+
         v_changed = v != b
         c_changed = c != b
 
         if not v_changed and not c_changed:
             # In sync already; make sure Cork Dork actually holds b bottles
-            # (covers a fresh baseline that matches but storage drifted).
+            # (covers a baseline that matches but local storage drifted).
             if c != v:
                 _emit_delta(plan, vid, vivino_state, c, v)
             continue
@@ -148,13 +155,8 @@ def reconcile(
             continue
 
         if c_changed and not v_changed:
-            # On first sync there is no real baseline, so a Cork Dork count
-            # that differs from Vivino is just "not imported yet", not a
-            # local edit — treat Vivino as the target instead of a push.
-            if first_sync:
-                _emit_delta(plan, vid, vivino_state, c, v)
-            else:
-                plan.push.append((vid, v, c))
+            # Cork Dork is the only mover → push the change to Vivino
+            plan.push.append((vid, v, c))
             continue
 
         # Both changed

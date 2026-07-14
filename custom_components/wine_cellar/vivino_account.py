@@ -19,6 +19,7 @@ unknown fields are ignored rather than raising.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -32,6 +33,12 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_create_clientsession
 
 from .const import DOMAIN
+from .vivino_reconcile import (
+    build_corkdork_state,
+    build_vivino_state,
+    is_delete_wave_suspicious,
+    reconcile,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -39,6 +46,10 @@ WWW_BASE = "https://www.vivino.com"
 
 REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=30)
 MAX_PAGES = 60  # safety cap
+
+# Write-back pacing to stay under Vivino's rate limiting.
+PUSH_SPACING_SECONDS = 2.0
+MAX_PUSHES_PER_SYNC = 12
 
 HEADERS = {
     "User-Agent": (
@@ -697,6 +708,136 @@ def _wine_key(wine: dict[str, Any]) -> tuple[str, str, Any]:
     )
 
 
+async def _reconcile_cellar(
+    hass: HomeAssistant,
+    storage: Any,
+    client: VivinoAccountClient,
+    cellar: list[dict[str, Any]],
+    result: dict[str, Any],
+    apply_pushback: bool,
+) -> None:
+    """Reconcile the fetched Vivino cellar against Cork Dork and apply changes."""
+    vivino_state = build_vivino_state(cellar)
+    corkdork_counts = build_corkdork_state(storage.wines)
+    old_baseline = storage.get_vivino_baseline()
+    plan = reconcile(old_baseline, vivino_state, corkdork_counts)
+
+    vivino_total = sum(e.get("count", 0) for e in vivino_state.values())
+    corkdork_total = sum(corkdork_counts.values())
+    result["cellar_total"] = vivino_total
+
+    # Guard 1: a suspiciously large delete wave (probably a bad/short fetch)
+    # must not delete from Cork Dork.
+    removes_suspicious = is_delete_wave_suspicious(plan, vivino_total, corkdork_total)
+    # Guard 2: a large consume push (Cork Dork far below Vivino, e.g. local
+    # data loss) must not wipe the user's Vivino cellar.
+    push_consume = sum(frm - to for (_v, frm, to) in plan.push if to < frm)
+    pushback_suspicious = push_consume > max(3, int(0.25 * vivino_total))
+
+    # ── Apply Vivino → Cork Dork adds (safe: local only) ──────────────
+    added = 0
+    for vid, wine, n in plan.add:
+        for _ in range(n):
+            wine_data = {
+                k: v for k, v in wine.items()
+                if k not in ("owned_count", "bottle_count", "count")
+            }
+            wine_data["cabinet_id"] = ""      # lands in the Unassigned tab
+            wine_data["source"] = "vivino_cellar"
+            storage.add_wine(wine_data)
+            added += 1
+
+    # ── Apply Vivino → Cork Dork removals (unless suspicious) ─────────
+    removed = 0
+    if plan.remove and removes_suspicious:
+        result["errors"].append(
+            f"Skipped removing {plan.remove_count} bottle(s): Vivino returned "
+            "suspiciously few wines (possible bad fetch) — not deleting locally."
+        )
+    else:
+        for vid, n in plan.remove:
+            removed += storage.remove_vivino_bottles(vid, n)
+
+    # ── Apply Cork Dork → Vivino push-back (paced + capped) ──────────
+    pushed = 0
+    push_failed = 0
+    succeeded: set[str] = set()
+    if apply_pushback and plan.push and not pushback_suspicious:
+        for vid, frm, to in plan.push:
+            if pushed + push_failed >= MAX_PUSHES_PER_SYNC:
+                break  # remainder stays queued and retries next sync
+            try:
+                res = await client.async_change_bottles(int(vid), to - frm)
+                if res.get("ok"):
+                    pushed += 1
+                    succeeded.add(vid)
+                else:
+                    push_failed += 1
+            except Exception as err:
+                push_failed += 1
+                _LOGGER.warning("Vivino push-back failed for %s: %s", vid, err)
+            await asyncio.sleep(PUSH_SPACING_SECONDS)
+    elif plan.push and pushback_suspicious:
+        result["errors"].append(
+            f"Skipped pushing {push_consume} removal(s) to Vivino: Cork Dork has "
+            "far fewer bottles than Vivino (possible local data loss) — not "
+            "modifying your Vivino cellar."
+        )
+
+    # ── Rebuild the baseline = the newly-agreed state ────────────────
+    # Wines that are still not reconciled (conflicts, failed/capped/suspicious
+    # pushes, skipped removals) keep their OLD baseline so the discrepancy is
+    # re-detected and retried next sync instead of being silently accepted.
+    corkdork_after = build_corkdork_state(storage.wines)
+    unresolved: set[str] = {vid for (vid, _b, _v, _c) in plan.conflicts}
+    unresolved |= {vid for (vid, _f, _t) in plan.push if vid not in succeeded}
+    if removes_suspicious:
+        unresolved |= {vid for (vid, _n) in plan.remove}
+
+    new_baseline: dict[str, Any] = {}
+    for vid in set(vivino_state) | set(corkdork_after) | set(old_baseline):
+        if vid in unresolved:
+            if vid in old_baseline:
+                new_baseline[vid] = old_baseline[vid]
+            continue
+        cnt = corkdork_after.get(vid, 0)
+        if cnt <= 0:
+            continue
+        meta = vivino_state.get(vid, {}).get("wine") or {}
+        ob = old_baseline.get(vid, {})
+        new_baseline[vid] = {
+            "count": cnt,
+            "name": meta.get("name") or ob.get("name", ""),
+            "winery": meta.get("winery") or ob.get("winery", ""),
+            "vintage": meta.get("vintage", ob.get("vintage")),
+        }
+    storage.set_vivino_baseline(new_baseline)
+
+    # Informational queue of pushes not yet applied
+    pending = [
+        {"vintage_id": vid, "from": frm, "to": to}
+        for (vid, frm, to) in plan.push if vid not in succeeded
+    ]
+    storage.set_vivino_pending_push(pending)
+
+    result["cellar_added"] = added
+    result["cellar_removed"] = removed
+    result["cellar_imported"] = added  # backward-compat
+    result["cellar_pushed"] = pushed
+    result["cellar_push_failed"] = push_failed
+    result["cellar_pending_push"] = len(pending)
+    result["cellar_conflicts"] = len(plan.conflicts)
+    result["conflicts_detail"] = [
+        {"vintage_id": vid, "baseline": b, "vivino": v, "cork": c}
+        for (vid, b, v, c) in plan.conflicts
+    ]
+    _LOGGER.info(
+        "Vivino reconcile: +%d/-%d local, %d pushed (%d failed, %d pending), "
+        "%d conflicts", added, removed, pushed, push_failed, len(pending),
+        len(plan.conflicts),
+    )
+
+
 async def async_sync_from_vivino(
     hass: HomeAssistant,
     storage: Any,
@@ -704,17 +845,27 @@ async def async_sync_from_vivino(
     sync_cellar: bool = True,
     sync_wishlist: bool = True,
     sync_my_wines: bool = False,
+    apply_pushback: bool = True,
 ) -> dict[str, Any]:
-    """Import Vivino data: cellar and/or "My Wines" into the wine inventory,
-    and the wishlist into the buy list.
+    """Two-way reconcile between the Vivino cellar and Cork Dork.
 
-    Existing entries are never modified or removed; only missing bottles are
-    added (matched by Vivino vintage id, else by name+winery+vintage).
-    Returns a result summary dict, also stored for the status sensor.
+    Uses a stored baseline (last-synced state) for a three-way merge:
+    Vivino-side changes are applied to Cork Dork (adds and removals),
+    Cork-Dork-side changes are pushed back to Vivino (paced + capped),
+    and both-sides-differ cases are flagged as conflicts and left untouched.
+    Guarded so a bad fetch can't wipe Cork Dork and corrupt local data can't
+    wipe Vivino. Returns a result summary, also stored for the status sensor.
     """
     result: dict[str, Any] = {
         "cellar_total": 0,
-        "cellar_imported": 0,
+        "cellar_imported": 0,          # backward-compat alias for added
+        "cellar_added": 0,
+        "cellar_removed": 0,
+        "cellar_pushed": 0,
+        "cellar_push_failed": 0,
+        "cellar_pending_push": 0,
+        "cellar_conflicts": 0,
+        "conflicts_detail": [],
         "cellar_skipped_no_bottles": 0,
         "wishlist_total": 0,
         "wishlist_imported": 0,
@@ -726,86 +877,26 @@ async def async_sync_from_vivino(
 
     client.reset_session_backoff()
 
-    # Shared bookkeeping of what's already in the local cellar, so cellar
-    # and My Wines imports in the same run dedupe against each other too.
-    existing_ids: dict[str, int] = {}
-    existing_keys: dict[tuple, int] = {}
-    for wine in storage.wines:
-        vid = wine.get("vivino_id")
-        if vid:
-            existing_ids[vid] = existing_ids.get(vid, 0) + 1
-        key = _wine_key(wine)
-        existing_keys[key] = existing_keys.get(key, 0) + 1
-
-    def _import_wines(entries: list[dict[str, Any]], source: str) -> tuple[int, int]:
-        """Add missing owned bottles to the local cellar.
-
-        Entries whose Vivino bottle count is zero or missing are skipped —
-        rated/drunk wines without bottles must not become inventory.
-        Returns (imported, skipped) counts.
-        """
-        imported = 0
-        skipped = 0
-        for entry in entries:
-            owned = entry.get("owned_count")
-            if not owned or owned <= 0:
-                skipped += 1
-                continue
-            wanted = entry.get("bottle_count", 1)
-            vid = entry.get("vivino_id", "")
-            key = _wine_key(entry)
-            have = existing_ids.get(vid, 0) if vid else existing_keys.get(key, 0)
-            for _ in range(max(0, wanted - have)):
-                wine_data = {
-                    k: v for k, v in entry.items()
-                    if k not in ("bottle_count", "owned_count")
-                }
-                wine_data["cabinet_id"] = ""  # lands in the Unassigned tab
-                wine_data["source"] = source
-                storage.add_wine(wine_data)
-                imported += 1
-            # Track additions so a duplicate entry later in this same
-            # sync doesn't import its bottles again
-            if vid:
-                existing_ids[vid] = max(have, wanted)
-            existing_keys[key] = max(existing_keys.get(key, 0), wanted)
-        if skipped:
-            _LOGGER.debug(
-                "Vivino %s: skipped %d wines with no bottles", source, skipped
-            )
-        return imported, skipped
-
     if sync_cellar:
+        cellar: list[dict[str, Any]] | None = None
         try:
             cellar = await client.async_get_cellar()
-            # Total = bottles the user owns per Vivino, not raw record count
-            result["cellar_total"] = sum(w.get("owned_count") or 0 for w in cellar)
-            (
-                result["cellar_imported"],
-                result["cellar_skipped_no_bottles"],
-            ) = _import_wines(cellar, "vivino_cellar")
         except VivinoAuthError as err:
             result["errors"].append(f"Cellar: {err}")
         except Exception as err:
-            _LOGGER.warning("Vivino cellar sync failed: %s", err)
+            _LOGGER.warning("Vivino cellar fetch failed: %s", err)
             result["errors"].append(f"Cellar: {err}")
+
+        if cellar is not None:
+            await _reconcile_cellar(
+                hass, storage, client, cellar, result, apply_pushback
+            )
 
     if sync_my_wines:
         try:
-            my_wines = await client.async_get_my_wines()
-            # Total = bottles the user owns per Vivino; rated wines without
-            # bottles are counted separately as skipped
-            result["my_wines_total"] = sum(
-                w.get("owned_count") or 0 for w in my_wines
-            )
-            (
-                result["my_wines_imported"],
-                result["my_wines_skipped_no_bottles"],
-            ) = _import_wines(my_wines, "vivino_my_wines")
-        except VivinoAuthError as err:
-            result["errors"].append(f"My Wines: {err}")
+            mw = await client.async_get_my_wines()  # currently returns []
+            result["my_wines_total"] = sum(w.get("owned_count") or 0 for w in mw)
         except Exception as err:
-            _LOGGER.warning("Vivino My Wines sync failed: %s", err)
             result["errors"].append(f"My Wines: {err}")
 
     if sync_wishlist:
@@ -870,15 +961,28 @@ async def async_sync_from_vivino(
             persistent_notification.async_dismiss(
                 hass, "wine_cellar_vivino_reauth"
             )
+        # Surface conflicts (both sides changed a wine differently)
+        if result.get("cellar_conflicts"):
+            persistent_notification.async_create(
+                hass,
+                f"{result['cellar_conflicts']} wine(s) changed in both Cork Dork "
+                "and Vivino since the last sync and couldn't be reconciled "
+                "automatically. Adjust one side to match, then sync again.",
+                title="Vivino sync conflicts",
+                notification_id="wine_cellar_vivino_conflicts",
+            )
+        else:
+            persistent_notification.async_dismiss(
+                hass, "wine_cellar_vivino_conflicts"
+            )
     except Exception:  # notifications are best-effort
         pass
 
     _LOGGER.info(
-        "Vivino sync: %d/%d cellar bottles, %d/%d my-wines, %d/%d wishlist "
-        "imported, %d errors",
-        result["cellar_imported"], result["cellar_total"],
-        result["my_wines_imported"], result["my_wines_total"],
-        result["wishlist_imported"], result["wishlist_total"],
-        len(result["errors"]),
+        "Vivino sync: cellar +%d/-%d (own %d), pushed %d, %d conflicts, "
+        "%d wishlist, %d errors",
+        result["cellar_added"], result["cellar_removed"], result["cellar_total"],
+        result["cellar_pushed"], result["cellar_conflicts"],
+        result["wishlist_imported"], len(result["errors"]),
     )
     return result
