@@ -378,6 +378,24 @@ class WineCellarStorage:
         """Store the last Vivino sync result (persisted across restarts)."""
         self._data["vivino_sync_status"] = status
 
+    def get_vivino_baseline(self) -> dict[str, Any]:
+        """Return the last-synced Vivino cellar baseline (vivino_id -> entry)."""
+        base = self._data.get("vivino_baseline")
+        return base if isinstance(base, dict) else {}
+
+    def set_vivino_baseline(self, baseline: dict[str, Any]) -> None:
+        """Store the Vivino cellar baseline used for three-way reconciliation."""
+        self._data["vivino_baseline"] = baseline
+
+    def get_vivino_pending_push(self) -> list[dict[str, Any]]:
+        """Return queued Cork Dork -> Vivino changes awaiting write-back."""
+        pending = self._data.get("vivino_pending_push")
+        return pending if isinstance(pending, list) else []
+
+    def set_vivino_pending_push(self, pending: list[dict[str, Any]]) -> None:
+        """Store queued Cork Dork -> Vivino changes (Phase 2 write-back)."""
+        self._data["vivino_pending_push"] = pending
+
     # ── Backup / Restore ─────────────────────────────────────────────
 
     def get_backup_data(self) -> dict[str, Any]:
